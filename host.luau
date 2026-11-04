@@ -48,6 +48,8 @@ type State = {
 	peek: Peek?,
 	--- The pane a peek was requested for and not yet answered.
 	peeking: number?,
+	--- A destructive action waiting for the user's confirmation in the dock.
+	confirm: { verb: string, pane: number, title: string }?,
 	timer: TimerHandle?,
 	--- The rows in display order, as the last `view` laid them out.
 	order: { Entry },
@@ -63,7 +65,19 @@ local STALE_S = 25
 local TICK_MS = 15000
 local MESSAGE_CHARS = 1500
 -- Right-click actions of a pane row; sent lowercased as the action verb.
-local ROW_MENU = { "Go", "Peek", "Ask", "Park", "Dismiss" }
+local ROW_MENU = { "Go", "Peek", "Ask", "Interrupt", "Pin", "New agent", "Park", "Dismiss" }
+-- Row-menu labels and button acts, as the verbs the window half knows.
+local ACTION_VERBS: { [string]: string } = {
+	go = "go",
+	peek = "peek",
+	ask = "ask",
+	interrupt = "interrupt",
+	pin = "pin",
+	["new agent"] = "new_agent",
+	new_agent = "new_agent",
+	park = "park",
+	dismiss = "dismiss",
+}
 
 local KIND_ICON: { [string]: string } = {
 	terminal = "terminal",
@@ -581,9 +595,13 @@ local function detail_card(state: State, entry: Entry?): Node
 		ui.button("Go", { key = "go", variant = "primary", size = "sm", keys = { "enter" }, disabled = offline, actions = { click = "go" } }),
 	}))
 	table.insert(children, with(ui.kv(facts), { key = "facts" }))
+	local not_agent = if is_agent then nil else "Only a running agent"
 	table.insert(children, ui.node("row", { key = "actions", gap = "sm", wrap = true }, {
 		sm("Peek", "peek", { icon = "eye", keys = { "." }, busy = state.peeking == row.pane, disabled = offline }),
-		sm("Ask update", "ask", { icon = "message", keys = { "u" }, disabled = offline or (if is_agent then nil else "Only a running agent can be asked") }),
+		sm("Ask", "ask", { icon = "message", keys = { "u" }, disabled = offline or not_agent }),
+		sm("Interrupt", "interrupt", { icon = "stop", keys = { "i" }, variant = "danger", disabled = offline or not_agent }),
+		sm(if row.floating then "Unpin" else "Pin", "pin", { icon = "pin", keys = { "f" }, on = row.floating == true, disabled = offline }),
+		sm("New agent", "new_agent", { icon = "sparkle", keys = { "n" }, disabled = offline or (if row.cwd ~= "" then nil else "No known directory") }),
 		sm(if row.parked then "Restore" else "Park", "park", { icon = "stack", keys = { "p" }, disabled = offline }),
 		sm("Dismiss", "dismiss", { icon = "check", keys = { "x" }, disabled = if has_problem then nil else "Nothing to dismiss on this pane" }),
 	}))
@@ -775,14 +793,29 @@ local function view(state: State, cx: BlockCx): BlockView
 		table.insert(keys, ui.span(k, "key"))
 		table.insert(keys, ui.span(" " .. label .. "  ", "muted"))
 	end
-	if state.editing then
+	local dock: { Node } = {}
+	local confirm = state.confirm
+	if confirm then
+		hint("⏎", "confirm")
+		hint("esc", "cancel")
+		table.insert(dock, ui.node("card", { key = "confirm", tone = "error", icon = "warn", head = "Interrupt " .. confirm.title .. "?", ["end"] = "dock.confirm.end" }, {
+			ui.node("row", { key = "end", gap = "sm" }, {
+				ui.button("Cancel", { key = "cancel", variant = "quiet", size = "sm", keys = { "esc" }, actions = { click = "cancel" } }),
+				ui.button("Interrupt", { key = "ok", variant = "danger", size = "sm", keys = { "enter" }, actions = { click = "confirm" } }),
+			}),
+			ui.text({ ui.span("Sends Ctrl-C to its current turn; the agent and its block stay open.", "muted") }),
+		}))
+	elseif state.editing then
 		hint("⏎", "keep filter")
 		hint("esc", "clear")
 	else
 		hint("↑↓", "select")
 		hint("⏎", "go")
 		hint(".", "peek")
-		hint("u", "ask update")
+		hint("u", "ask")
+		hint("i", "interrupt")
+		hint("f", "pin")
+		hint("n", "new agent")
 		hint("p", "park")
 		hint("x", "dismiss")
 		hint("/", "filter")
@@ -790,9 +823,10 @@ local function view(state: State, cx: BlockCx): BlockView
 		hint("v", "scope")
 		hint("g", "group")
 	end
+	table.insert(dock, ui.node("text", { key = "keys", spans = keys, lines = 1 }))
 	return {
 		main = with(ui.node("col", { gap = "lg" }, parts), { role = "control-room.main" }),
-		dock = ui.col({ ui.node("text", { key = "keys", spans = keys, lines = 1 }) }),
+		dock = ui.col(dock),
 	}
 end
 
@@ -856,8 +890,14 @@ local function act(state: State, verb: string)
 		state.cx:toast("info", "Control Room is not getting updates from the window", "Run Reload plugins from the palette, then try again.")
 		return
 	end
-	if verb == "ask" and (row.agent == nil or row.agent.state == "exited") then
-		state.cx:toast("info", "Only a running agent can be asked for an update", common.clip(row.title, 60))
+	local is_agent = row.agent ~= nil and row.agent.state ~= "exited"
+	if (verb == "ask" or verb == "interrupt") and not is_agent then
+		state.cx:toast("info", "Only a running agent can be " .. (if verb == "ask" then "asked" else "interrupted"), common.clip(row.title, 60))
+		return
+	end
+	if verb == "interrupt" then
+		-- Confirmed from the dock's strip (Enter or the Interrupt button) before it is sent.
+		state.confirm = { verb = verb :: string, pane = row.pane, title = label_of(row) }
 		return
 	end
 	if verb == "peek" then
@@ -906,6 +946,7 @@ local room: BlockDef<State> = {
 			peeking = nil,
 			timer = nil,
 			order = {},
+			confirm = nil,
 		}
 		running[cx.pane] = state
 		start_timer(state)
@@ -941,6 +982,19 @@ local room: BlockDef<State> = {
 		if key.ctrl or key.meta or key.alt then
 			return false
 		end
+		local pending = state.confirm
+		if pending then
+			if name == "enter" then
+				state.confirm = nil
+				state.cursor = pending.pane
+				request(state, pending.verb, pending.pane)
+			elseif name == "escape" then
+				state.confirm = nil
+			else
+				return false
+			end
+			return true
+		end
 		local press = text or name
 		if name == "up" or press == "k" then
 			move(state, -1)
@@ -964,6 +1018,12 @@ local room: BlockDef<State> = {
 			act(state, "park")
 		elseif press == "x" then
 			act(state, "dismiss")
+		elseif press == "i" then
+			act(state, "interrupt")
+		elseif press == "f" then
+			act(state, "pin")
+		elseif press == "n" then
+			act(state, "new_agent")
 		elseif press == "/" then
 			focus_filter(state, true)
 		elseif name == "tab" or press == "]" then
@@ -1039,7 +1099,18 @@ local room: BlockDef<State> = {
 		end
 		if ev.ev == "action" then
 			local verb = string.lower(tostring(ev.act))
-			if verb == "go" or verb == "ask" or verb == "park" or verb == "dismiss" or verb == "peek" then
+			if verb == "confirm" or verb == "cancel" then
+				if verb == "confirm" and state.confirm then
+					local pending = state.confirm
+					state.confirm = nil
+					state.cursor = pending.pane
+					request(state, pending.verb, pending.pane)
+				else
+					state.confirm = nil
+				end
+				return
+			end
+			if ACTION_VERBS[verb] then
 				local pane = pane_of(ev.item)
 				if pane then
 					state.cursor = pane
@@ -1050,7 +1121,7 @@ local room: BlockDef<State> = {
 						state.order = flatten((layout(state)))
 					end
 				end
-				act(state, verb)
+				act(state, ACTION_VERBS[verb])
 			end
 		end
 	end,

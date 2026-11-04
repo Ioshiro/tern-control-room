@@ -42,6 +42,8 @@ export type Row = {
 	tab_pos: number?,
 	tab_name: string?,
 	parked: boolean,
+	--- Shown as a picture-in-picture over another pane.
+	floating: boolean?,
 	focused: boolean,
 	busy: boolean,
 	running: { line: string, ms: number }?,

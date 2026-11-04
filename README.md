@@ -61,7 +61,10 @@ urgente va in alto).
 | `↑`/`↓` (`k`/`j`), `PgUp`/`PgDn`, `Home`/`End` | seleziona |
 | `Enter` (`o`, doppio clic) | vai al pane: cambia sessione se serve, ripristina un pane parcheggiato, lo mette a fuoco |
 | `.` | *peek*: legge le ultime 12 righe del pane (e per un agente gli ultimi 4 messaggi della chat) e le mostra nella scheda |
-| `u` | chiedi un aggiornamento all'agente selezionato |
+| `u` | chiedi qualcosa all'agente selezionato (campo precompilato con lo status check) |
+| `i` | interrompi il turno dell'agente (con conferma) |
+| `f` | pin: pane in picture-in-picture sopra Control Room / rimettilo a posto |
+| `n` | nuovo agente nella cartella del pane selezionato |
 | `p` | parcheggia il pane / ripristinalo (resta a fuoco Control Room) |
 | `x` | archivia il problema della riga (vedi sotto) |
 | `/` | filtra: digita, `Enter` conferma, `Esc` cancella |
@@ -89,8 +92,8 @@ nello snapshot: la scheda la mostra finché resta selezionato quel pane. Serve
 soprattutto dove la shell non emette i marcatori OSC 133 e Tern non riporta
 i comandi.
 
-**Chiedere un aggiornamento (`u`)** invia all'agente, con
-`cx.agents:ask`, questo prompt:
+**Chiedere (`u`)** apre un campo precompilato con questo prompt, che puoi
+riscrivere; `Enter` lo invia all'agente con `cx.agents:ask`:
 
 > Status check from Control Room: in a few lines, what have you done so far,
 > what are you doing now, and is anything blocking you or waiting on me?
@@ -103,13 +106,30 @@ l'ultimo messaggio dell'agente alla fine del turno che risponde alla
 richiesta. Se dopo 10 minuti non è arrivata nessuna risposta, la richiesta
 viene lasciata cadere.
 
-Per cambiare il testo della richiesta, imposta la chiave `ask_prompt` nel
+Per cambiare il testo proposto, imposta la chiave `ask_prompt` nel
 `kv.json` del plugin (`<state>/plugin-data/control-room/kv.json`).
+
+**Interrompere (`i`)** chiede conferma in una striscia in basso (`Enter`
+conferma, `Esc` annulla) e poi manda Ctrl-C al turno in corso con
+`cx.agents:interrupt`: l'agente e il suo blocco restano aperti.
+
+**Pin (`f`)** mette il pane in picture-in-picture sopra Control Room
+(`cx.layout:float`), anche se sta in un'altra sessione, così lo guardi senza
+uscire; `f` di nuovo lo rimette nel tab da cui veniva. Il tab di origine è
+ricordato dalla finestra: dopo un reload del plugin un pane già pinnato torna
+accanto a Control Room invece che a casa sua.
+
+**Nuovo agente (`n`)** chiede un prompt e avvia un agente in un nuovo tab
+nella cartella del pane selezionato (`cx.agents:start`).
 
 **Failures** elenca gli ultimi 20 comandi con exit ≠ 0 arrivati come evento
 `command_finished` a una finestra con il plugin caricato, solo per i pane
 ancora aperti. Stanno nel `kv.json` (chiave `failures`), quindi sopravvivono
 al reload. Il tasto destro su una riga porta al pane o ne fa il peek.
+
+**Fuori dal blocco**: finché qualche pane richiede attenzione, il titolo
+della finestra inizia con `⚠ N` e la barra di stato (se attiva) mostra un
+segmento `N need attention` che apre Control Room al clic.
 
 ## Aprirlo
 
@@ -149,7 +169,7 @@ tern plugin link ./tern-control-room
 ```
 
 Verifica con `tern plugin list`, che deve mostrare
-`control-room 0.2.0 Control Room — 1 blocks, 0 lenses, window  ready`.
+`control-room 0.3.0 Control Room — 1 blocks, 0 lenses, window  ready`.
 Per rimuoverlo: `tern plugin remove control-room` (o `tern plugin unlink control-room`
 se era collegato).
 
@@ -159,7 +179,7 @@ se era collegato).
 window.luau (in ogni finestra)               host.luau (nel daemon)
   legge cx.session, cx.sessions,  ── snapshot ─▶  blocco "room": viste, filtro,
   cx.agents a ogni evento e ogni 5 s   ── peek ──▶  ordinamento, pagina
-  esegue go / park / ask / peek  ◀── control-room://<azione>/<pane> ──
+  esegue go / park / ask / peek / pin … ◀── control-room://<azione>/<pane> ──
 ```
 
 Il blocco gira nel daemon, che conosce solo titolo, cartella e "busy" dei
@@ -175,8 +195,9 @@ metà finestra del plugin, che quindi:
    più finestre aperte; un *peek* risponde con un secondo evento di vista.
 
 Lo stato tenuto dalla finestra è: quando ha visto cambiare un pane (Tern non
-lo riporta), quale agente ha avuto l'ultimo turno fallito, e la richiesta di
-aggiornamento in corso con la sua risposta; si azzera al reload. Senza
+lo riporta), quale agente ha avuto l'ultimo turno fallito, da quale tab viene
+un pane pinnato, e la richiesta di aggiornamento in corso con la sua
+risposta; si azzera al reload. Senza
 snapshot da più di 25 secondi il blocco lo segnala; finché nessuna finestra
 ha riferito, mostra solo ciò che sa il daemon.
 

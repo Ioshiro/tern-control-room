@@ -80,6 +80,9 @@ local function str(v: any): string?
 	return if type(v) == "string" and v ~= "" then v else nil
 end
 
+-- Panes needing attention at the last snapshot, for the window title and the status line.
+local chrome_attention = 0
+
 local function num(v: any): number?
 	return if type(v) == "number" then v else nil
 end
@@ -220,6 +223,7 @@ local function snapshot(cx: WindowCx): (common.Snapshot, { number })
 				tab_pos = if tab then tab.position else nil,
 				tab_name = if tab and type(tab.name) == "string" and tab.name ~= "" then tab.name else nil,
 				parked = p.parked == true,
+				floating = p.floating == true,
 				focused = p.focused == true,
 				busy = p.busy == true,
 				running = p.running,
@@ -237,6 +241,18 @@ local function snapshot(cx: WindowCx): (common.Snapshot, { number })
 		if not live[id] then
 			seen[id] = nil
 		end
+	end
+	-- The attention count the chrome formatters show.
+	local acks = common.acks()
+	local attention = 0
+	for _, row in rows do
+		if common.classify(row, acks).level == "attention" then
+			attention += 1
+		end
+	end
+	if attention ~= chrome_attention then
+		chrome_attention = attention
+		tern.chrome.refresh()
 	end
 	local sessions: { common.SessionRef } = {}
 	for _, s in cx.session:sessions() do
@@ -391,21 +407,27 @@ local function park(cx: WindowCx, pane: number)
 	end
 end
 
-local function ask(cx: WindowCx, pane: number)
-	local title = (cx.session:pane(pane) or { title = "agent" } :: any).title
-	local text = ask_text()
+local function title_of(cx: WindowCx, pane: number): string
+	local info = cx.session:pane(pane)
+	return common.clip(if info and info.title ~= "" then info.title else "agent", 40)
+end
+
+--- Sends `text` to the agent in `pane` and keeps its reply pinned in the block
+--- until a later turn ends with something newer.
+local function send(cx: WindowCx, pane: number, text: string)
+	local title = title_of(cx, pane)
 	local ok, err = pcall(function()
 		cx.agents:ask(pane, text)
 	end)
 	if not ok then
-		cx:toast("error", "Could not ask " .. common.clip(title, 40) .. " for an update", tostring(err))
+		cx:toast("error", "Could not send to " .. title, tostring(err))
 		return
 	end
 	local s = seen[common.id(pane)]
 	if s then
 		s.ask = { text = text, at = os.time() }
 	end
-	cx:toast("info", "Asked " .. common.clip(title, 40) .. " for an update", "Its reply stays in Control Room until the agent finishes its next turn.")
+	cx:toast("info", "Sent to " .. title, "Its reply stays in Control Room until the agent finishes its next turn.")
 	-- Resolves when the turn that answers the request ends, with its last message.
 	cx.agents:wait(pane, { timeout = ASK_TIMEOUT_MS }):next(function(message: string?, wait_err: string?, _later: WindowCx?)
 		local s2 = seen[common.id(pane)]
@@ -419,6 +441,100 @@ local function ask(cx: WindowCx, pane: number)
 		end
 		poke()
 	end)
+end
+
+--- Asks the user what to send, starting from the status-check prompt.
+local function ask(cx: WindowCx, pane: number)
+	cx:prompt({ value = ask_text(), placeholder = "Message for " .. title_of(cx, pane), icon = "message", action = "send" })
+		:next(function(text: string?, _err: string?, later: WindowCx?)
+			local trimmed = if text then string.match(text, "^%s*(.-)%s*$") else nil
+			if later and trimmed and trimmed ~= "" then
+				send(later, pane, trimmed)
+			end
+		end)
+end
+
+--- Ctrl-C to the agent's current turn; the block stays. The block asks only
+--- after its confirm strip, so no second confirmation here.
+local function interrupt(cx: WindowCx, pane: number)
+	local title = title_of(cx, pane)
+	local ok, err = pcall(function()
+		cx.agents:interrupt(pane)
+	end)
+	if ok then
+		cx:toast("info", "Interrupted " .. title)
+	else
+		cx:toast("error", "Could not interrupt " .. title, tostring(err))
+	end
+end
+
+-- Where each pinned pane came from, so unpinning puts it back there (docking
+-- alone would leave a pane from another session beside the Control Room).
+local pinned_from: { [string]: number } = {}
+
+--- Floats the pane over the Control Room block that asked (`from`), so it can
+--- be watched without leaving the room; floating already, puts it back.
+local function pin(cx: WindowCx, pane: number, from: number?)
+	local info = cx.session:pane(pane)
+	if info == nil then
+		cx:toast("error", "That pane is gone")
+		return
+	end
+	local id = common.id(pane)
+	if info.floating then
+		local home = pinned_from[id]
+		pinned_from[id] = nil
+		-- A floating pane still belongs to its tab for `move_to_tab`: dock it
+		-- first, then move it when the dock put it beside the Control Room.
+		local ok, why = cx.layout:dock(pane, nil, nil, { focus = false })
+		if ok and home and cx.session:tab_of(pane) ~= home and cx.session:layout(home) then
+			ok, why = cx.layout:move_to_tab(pane, home, { focus = false })
+		end
+		if not ok then
+			cx:toast("error", "Could not put the pane back", why)
+		end
+		return
+	end
+	if info.parked then
+		local ok, why = cx.layout:unpark(pane, { focus = false })
+		if not ok then
+			cx:toast("error", "Could not restore the parked pane", why)
+			return
+		end
+	end
+	local home = cx.session:tab_of(pane)
+	local ok, why = cx.layout:float(pane, from, "br", { focus = false, size = { 0.5, 0.5 } })
+	if not ok then
+		cx:toast("error", "Could not float " .. title_of(cx, pane), why)
+		return
+	end
+	if home then
+		pinned_from[id] = home
+	end
+end
+
+--- Asks for a prompt and starts a new agent in the pane's directory, in a tab.
+local function new_agent(cx: WindowCx, pane: number)
+	local info = cx.session:pane(pane)
+	local cwd = if info and info.cwd and info.cwd ~= "" then info.cwd else nil
+	if cwd == nil then
+		cx:toast("error", "That pane has no known directory")
+		return
+	end
+	cx:prompt({ placeholder = "Prompt for a new agent in " .. common.basename(cwd), icon = "sparkle", action = "start" })
+		:next(function(text: string?, _err: string?, later: WindowCx?)
+			local trimmed = if text then string.match(text, "^%s*(.-)%s*$") else nil
+			if later == nil or trimmed == nil or trimmed == "" then
+				return
+			end
+			local ok, err = pcall(function()
+				later.agents:start({ prompt = trimmed, cwd = cwd, how = "tab" })
+			end)
+			if not ok then
+				later:toast("error", "Could not start an agent in " .. common.basename(cwd), tostring(err))
+			end
+			poke()
+		end)
 end
 
 --- Reads what `pane` shows now and sends it to every Control Room block as a
@@ -489,7 +605,15 @@ local function claim(nonce: string?): boolean
 	return true
 end
 
-local ACTIONS: { [string]: (WindowCx, number) -> () } = { go = go, park = park, ask = ask, peek = peek }
+local ACTIONS: { [string]: (WindowCx, number, number?) -> () } = {
+	go = go,
+	park = park,
+	ask = ask,
+	peek = peek,
+	interrupt = interrupt,
+	pin = pin,
+	new_agent = new_agent,
+}
 
 -- The link handler only checks the request and queues it: the action and the
 -- snapshot after it each get a call (and a budget) of their own.
@@ -509,9 +633,10 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 	end
 	local action = ACTIONS[verb]
 	if action and target then
+		local room = from.pane
 		tern.timer(0, function(later: WindowCx?)
 			if later and claim(nonce) then
-				action(later, target)
+				action(later, target, room)
 			end
 			poke()
 		end)
@@ -542,6 +667,33 @@ tern.command({
 -- `…+c` is taken by the canvas (`canvas.copy_as_png`) and plugin binds cannot
 -- replace a default: `r` for Room instead.
 tern.bind(if tern.runtime.os == "macos" then "cmd+alt+shift+r" else "ctrl+alt+shift+r", "plugin.control-room.open")
+
+-- Chrome: how many panes need attention, in the window title and the status line.
+tern.chrome.window_title(function(win: WindowInfo): string?
+	if chrome_attention == 0 then
+		return nil
+	end
+	local parts = { "⚠ " .. chrome_attention }
+	if type(win.tab) == "string" and win.tab ~= "" then
+		table.insert(parts, win.tab)
+	end
+	if type(win.space) == "string" and win.space ~= "" then
+		table.insert(parts, win.space)
+	end
+	return table.concat(parts, " · ")
+end)
+
+tern.chrome.status(function(_pane: StatusPaneInfo): { StatusSegment }?
+	if chrome_attention == 0 then
+		return nil
+	end
+	return { {
+		text = chrome_attention .. (if chrome_attention == 1 then " needs attention" else " need attention"),
+		icon = "gauge",
+		tone = "error",
+		command = "plugin.control-room.open",
+	} }
+end)
 
 -- Events --------------------------------------------------------------------
 
