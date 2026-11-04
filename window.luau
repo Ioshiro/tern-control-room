@@ -468,9 +468,95 @@ local function interrupt(cx: WindowCx, pane: number)
 	end
 end
 
--- Where each pinned pane came from, so unpinning puts it back there (docking
--- alone would leave a pane from another session beside the Control Room).
-local pinned_from: { [string]: number } = {}
+-- Where a pinned pane came from: its tab and session, and the pane it sat
+-- beside (on which side) in that tab's split tree, so unpinning puts it back
+-- there rather than beside the Control Room. Kept in `tern.kv` (`pinned`) so
+-- a plugin reload does not lose it.
+type Origin = { tab: number, session: number?, position: number?, beside: number?, dir: string? }
+
+local function origins(): { [string]: Origin }
+	local ok, value = pcall(tern.kv.get, "pinned")
+	return if ok and type(value) == "table" then value else {}
+end
+
+--- The leaf pane at the far side of `tree`: first (left/top) or last (right/bottom).
+local function edge_leaf(tree: TabTree, first: boolean): number?
+	local t = tree
+	while t.pane == nil do
+		local next = t[if first then 1 else 2]
+		if next == nil then
+			return nil
+		end
+		t = next
+	end
+	return t.pane
+end
+
+--- The pane next to `pane` in `tree` and the side `pane` is on: `left`/`up`
+--- when it is the first half of its split, `right`/`down` when the second.
+local function place_in(tree: TabTree, pane: number): (number?, string?)
+	if tree.pane ~= nil or tree[1] == nil or tree[2] == nil then
+		return nil, nil
+	end
+	for i = 1, 2 do
+		local half = tree[i]
+		if half.pane == pane then
+			local other = tree[3 - i]
+			local first = i == 1
+			local dir = if tree.split == "down" then (if first then "up" else "down") else (if first then "left" else "right")
+			-- Beside the sibling's leaf nearest to where the pane was.
+			return edge_leaf(other, first), dir
+		end
+		local beside, dir = place_in(half, pane)
+		if beside then
+			return beside, dir
+		end
+	end
+	return nil, nil
+end
+
+local function origin_of(cx: WindowCx, pane: number): Origin?
+	local tab = cx.session:tab_of(pane)
+	if tab == nil then
+		return nil
+	end
+	local origin: Origin = { tab = tab }
+	for _, t in cx.session:tabs() do
+		if t.id == tab then
+			origin.session, origin.position = t.session, t.position
+		end
+	end
+	local layout = cx.session:layout(tab)
+	if layout then
+		origin.beside, origin.dir = place_in(layout.root, pane)
+	end
+	return origin
+end
+
+--- Puts a docked pane back where `origin` says: beside its old neighbour, else
+--- in its old tab, else in a new tab of its old session.
+local function restore(cx: WindowCx, pane: number, origin: Origin): (boolean, string?)
+	local quiet: Reveal = { focus = false }
+	if origin.beside and origin.dir and cx.session:pane(origin.beside) then
+		if cx.layout:move(pane, origin.beside, origin.dir :: Dir, quiet) then
+			return true, nil
+		end
+	end
+	if cx.session:layout(origin.tab) then
+		if cx.session:tab_of(pane) == origin.tab then
+			return true, nil
+		end
+		return cx.layout:move_to_tab(pane, origin.tab, quiet)
+	end
+	local tab, why = cx.layout:move_to_new_tab(pane, origin.session, quiet)
+	if tab == nil then
+		return false, why
+	end
+	if origin.position then
+		cx.layout:order_tab(tab, origin.position)
+	end
+	return true, nil
+end
 
 --- Floats the pane over the Control Room block that asked (`from`), so it can
 --- be watched without leaving the room; floating already, puts it back.
@@ -481,14 +567,15 @@ local function pin(cx: WindowCx, pane: number, from: number?)
 		return
 	end
 	local id = common.id(pane)
+	local pinned = origins()
 	if info.floating then
-		local home = pinned_from[id]
-		pinned_from[id] = nil
-		-- A floating pane still belongs to its tab for `move_to_tab`: dock it
-		-- first, then move it when the dock put it beside the Control Room.
+		local origin = pinned[id]
+		pinned[id] = nil
+		pcall(tern.kv.set, "pinned", pinned)
+		-- A floating pane still belongs to a tab for `move_to_tab`: dock it first.
 		local ok, why = cx.layout:dock(pane, nil, nil, { focus = false })
-		if ok and home and cx.session:tab_of(pane) ~= home and cx.session:layout(home) then
-			ok, why = cx.layout:move_to_tab(pane, home, { focus = false })
+		if ok and origin then
+			ok, why = restore(cx, pane, origin)
 		end
 		if not ok then
 			cx:toast("error", "Could not put the pane back", why)
@@ -502,14 +589,15 @@ local function pin(cx: WindowCx, pane: number, from: number?)
 			return
 		end
 	end
-	local home = cx.session:tab_of(pane)
+	local origin = origin_of(cx, pane)
 	local ok, why = cx.layout:float(pane, from, "br", { focus = false, size = { 0.5, 0.5 } })
 	if not ok then
 		cx:toast("error", "Could not float " .. title_of(cx, pane), why)
 		return
 	end
-	if home then
-		pinned_from[id] = home
+	if origin then
+		pinned[id] = origin
+		pcall(tern.kv.set, "pinned", pinned)
 	end
 end
 

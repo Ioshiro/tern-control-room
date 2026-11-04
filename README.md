@@ -115,9 +115,10 @@ conferma, `Esc` annulla) e poi manda Ctrl-C al turno in corso con
 
 **Pin (`f`)** mette il pane in picture-in-picture sopra Control Room
 (`cx.layout:float`), anche se sta in un'altra sessione, così lo guardi senza
-uscire; `f` di nuovo lo rimette nel tab da cui veniva. Il tab di origine è
-ricordato dalla finestra: dopo un reload del plugin un pane già pinnato torna
-accanto a Control Room invece che a casa sua.
+uscire; `f` di nuovo lo rimette dov'era: accanto al pane che aveva di fianco,
+dallo stesso lato, nel suo tab (se quel pane è sparito, nel tab; se anche il
+tab è sparito, in un nuovo tab della sua sessione). L'origine sta nel
+`kv.json` (chiave `pinned`), quindi sopravvive al reload.
 
 **Nuovo agente (`n`)** chiede un prompt e avvia un agente in un nuovo tab
 nella cartella del pane selezionato (`cx.agents:start`).
@@ -169,7 +170,7 @@ tern plugin link ./tern-control-room
 ```
 
 Verifica con `tern plugin list`, che deve mostrare
-`control-room 0.3.0 Control Room — 1 blocks, 0 lenses, window  ready`.
+`control-room 0.3.1 Control Room — 1 blocks, 0 lenses, window  ready`.
 Per rimuoverlo: `tern plugin remove control-room` (o `tern plugin unlink control-room`
 se era collegato).
 
@@ -195,9 +196,8 @@ metà finestra del plugin, che quindi:
    più finestre aperte; un *peek* risponde con un secondo evento di vista.
 
 Lo stato tenuto dalla finestra è: quando ha visto cambiare un pane (Tern non
-lo riporta), quale agente ha avuto l'ultimo turno fallito, da quale tab viene
-un pane pinnato, e la richiesta di aggiornamento in corso con la sua
-risposta; si azzera al reload. Senza
+lo riporta), quale agente ha avuto l'ultimo turno fallito, e la richiesta
+di aggiornamento in corso con la sua risposta; si azzera al reload. Senza
 snapshot da più di 25 secondi il blocco lo segnala; finché nessuna finestra
 ha riferito, mostra solo ciò che sa il daemon.
 
