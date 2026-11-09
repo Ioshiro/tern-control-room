@@ -756,6 +756,14 @@ tern.command({
 -- replace a default: `r` for Room instead.
 tern.bind(if tern.runtime.os == "macos" then "cmd+alt+shift+r" else "ctrl+alt+shift+r", "plugin.control-room.open")
 
+-- Sizing: the host caps the table's and the card's scroll boxes in lines
+-- (`max.h`); Tern puts that on the box, but what scrolls is the view inside
+-- it, which this hands the cap down to. Without it the box grows with its
+-- rows and the whole block scrolls instead (as it does in the web client).
+tern.css("fill", [[
+.sf-main[data-surface='plugin.control-room.room'] .sf-scroll[data-role='control-room.scroll'] > .sf-scroll-view { max-height: inherit !important; }
+]])
+
 -- Chrome: how many panes need attention, in the window title and the status line.
 tern.chrome.window_title(function(win: WindowInfo): string?
 	if chrome_attention == 0 then

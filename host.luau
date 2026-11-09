@@ -535,8 +535,8 @@ local function sm(text: string, act: string, props: { [string]: any }): Node
 	return ui.button(text, p)
 end
 
-local function detail_card(state: State, entry: Entry?): Node
-	local props: { [string]: any } = { key = "detail", min = { w = "44ch" }, max = { w = "60ch" } }
+local function detail_card(state: State, entry: Entry?, rows: number): Node
+	local props: { [string]: any } = { key = "detail", role = "control-room.card", min = { w = "44ch" }, max = { w = "60ch" } }
 	if entry == nil then
 		return ui.card("No pane selected", { ui.text({ ui.span("Select a row to see what it is doing", "muted") }) }, props)
 	end
@@ -594,9 +594,13 @@ local function detail_card(state: State, entry: Entry?): Node
 	table.insert(children, ui.node("row", { key = "end", gap = "sm" }, {
 		ui.button("Go", { key = "go", variant = "primary", size = "sm", keys = { "enter" }, disabled = offline, actions = { click = "go" } }),
 	}))
-	table.insert(children, with(ui.kv(facts), { key = "facts" }))
+	-- Everything under the head scrolls as one box, capped like the table is:
+	-- the pane's height in cells (about 16px) minus the page chrome above the
+	-- card and the card's head (about 275px), in sans lines of 18px.
+	local body: { Node } = {}
+	table.insert(body, with(ui.kv(facts), { key = "facts" }))
 	local not_agent = if is_agent then nil else "Only a running agent"
-	table.insert(children, ui.node("row", { key = "actions", gap = "sm", wrap = true }, {
+	table.insert(body, ui.node("row", { key = "actions", gap = "sm", wrap = true }, {
 		sm("Peek", "peek", { icon = "eye", keys = { "." }, busy = state.peeking == row.pane, disabled = offline }),
 		sm("Ask", "ask", { icon = "message", keys = { "u" }, disabled = offline or not_agent }),
 		sm("Interrupt", "interrupt", { icon = "stop", keys = { "i" }, variant = "danger", disabled = offline or not_agent }),
@@ -610,20 +614,22 @@ local function detail_card(state: State, entry: Entry?): Node
 		local head = if update.reply
 			then "Reply to the update request · " .. common.ago(update.reply_at) .. " ago"
 			else "Update requested · waiting for the reply"
-		table.insert(children, with(ui.rule(head), { key = "upd-rule" }))
+		table.insert(body, with(ui.rule(head), { key = "upd-rule" }))
 		if update.reply then
-			table.insert(children, with(ui.md(common.cut(update.reply, MESSAGE_CHARS)), { key = "upd" }))
+			table.insert(body, with(ui.md(common.cut(update.reply, MESSAGE_CHARS)), { key = "upd" }))
 		end
 	end
 	-- The last message, unless it is the reply shown above.
 	if agent and agent.message and not (update and update.reply == agent.message) then
 		local head = "Last message from the agent" .. (if row.message_at then " · " .. common.ago(row.message_at) .. " ago" else "")
-		table.insert(children, with(ui.rule(head), { key = "msg-rule" }))
-		table.insert(children, with(ui.md(common.cut(agent.message, MESSAGE_CHARS)), { key = "msg" }))
+		table.insert(body, with(ui.rule(head), { key = "msg-rule" }))
+		table.insert(body, with(ui.md(common.cut(agent.message, MESSAGE_CHARS)), { key = "msg" }))
 	end
 	for _, n in peek_nodes(state, row.pane) do
-		table.insert(children, n)
+		table.insert(body, n)
 	end
+	local cap = math.max(4, math.floor((rows * 16 - 275) / 18))
+	table.insert(children, ui.node("scroll", { key = "body", role = "control-room.scroll", variant = "fade", gap = "sm", max = { h = cap .. "lines" } }, body))
 
 	props.icon = if row.parked then "stack" else KIND_ICON[row.kind] or "terminal"
 	props.meta = where(row, snap) .. (if row.cwd ~= "" then " · " .. project_of(row) else "")
@@ -768,11 +774,19 @@ local function view(state: State, cx: BlockCx): BlockView
 	end
 
 	local parts: { Node } = { head_row(state, total), stats_strip(counts), nav(state, total, counts) }
+	-- Only the table (and the long part of the card) scroll; the block never
+	-- does. The cap is in sans lines (18px): the pane's height in cells (about
+	-- 16px each) minus what the head, stats, tabs, toolbar, gaps and dock take
+	-- (about 240px). The window half's sheet hands it to the scrolling view.
+	local lines = math.max(6, math.floor((cx.rows * 16 - 240) / 18))
+	local function scroller(key: string, children: { Node }): Node
+		return ui.node("scroll", { key = key, role = "control-room.scroll", gap = "md", max = { h = lines .. "lines" } }, children)
+	end
 	local page: Node
 	if state.view == "failures" then
 		page = ui.node("col", { key = "failures", gap = "md" }, {
 			ui.node("text", { key = "about", spans = { ui.span("Commands that ended with a nonzero exit, as this window saw them finish; newest first. Right-click a row to go to its pane.", "muted") } }),
-			failures_table(state),
+			scroller("scroll", { failures_table(state) }),
 		})
 	elseif state.snap == nil and total == 0 then
 		page = ui.node("skeleton", { key = state.view, shape = "rows", rows = 6 })
@@ -780,10 +794,13 @@ local function view(state: State, cx: BlockCx): BlockView
 		-- The table takes the spare width and the card keeps its own; when both
 		-- don't fit side by side the row wraps and the card goes under the table.
 		-- (`cx.cols` is not reliable for a block in a split, so no width check.)
-		local list = ui.node("col", { key = "list", gap = "md", grow = 1, basis = 0, min = { w = "60ch" } }, { toolbar(state), pane_lists(state, groups) })
-		local card = detail_card(state, sel_entry)
+		local list = ui.node("col", { key = "list", gap = "md", grow = 1, basis = 0, min = { w = "60ch" } }, {
+			toolbar(state),
+			scroller("scroll", { pane_lists(state, groups) }),
+		})
+		local card = detail_card(state, sel_entry, cx.rows)
 		page = ui.node("col", { key = state.view }, {
-			ui.node("row", { key = "body", gap = "lg", align = "stretch", wrap = true }, { list, card }),
+			ui.node("row", { key = "body", gap = "lg", align = "start", wrap = true }, { list, card }),
 		})
 	end
 	table.insert(parts, page)
@@ -955,6 +972,8 @@ local room: BlockDef<State> = {
 		return state
 	end,
 	view = view,
+	-- The scroll caps follow `cx.rows`: a resize must render again.
+	resize = function(_state: State, _cols: number, _rows: number, _cx: BlockCx) end,
 	title = title,
 	key = function(state: State, key: Key, _cx: BlockCx): boolean?
 		local name = key.name

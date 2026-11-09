@@ -1,7 +1,7 @@
 schema = 1
 id = "control-room"
 name = "Control Room"
-version = "0.3.1"
+version = "0.3.2"
 description = "One persistent block to re-enter parallel work: sessions, tabs and agents, attention first."
 icon = "gauge"
 host = "host.luau"

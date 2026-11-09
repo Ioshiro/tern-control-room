@@ -35,8 +35,9 @@ Pane · Where · Status · Last · Age              ┌ pane selezionato        
   messaggio dell'agente) e da quanto è cambiata. Le colonne meno importanti si
   nascondono quando il blocco è stretto. Il tasto destro su una riga offre le
   stesse azioni della scheda.
-- **Scheda del pane selezionato**: accanto alla tabella quando il blocco è largo
-  almeno 110 colonne, sotto altrimenti. Mostra cartella, programma, comando in
+- **Scheda del pane selezionato**: accanto alla tabella quando ci sta, sotto
+  altrimenti. La pagina sta nell'altezza del pane: scorrono solo la tabella e
+  il corpo della scheda, non il blocco intero. Mostra cartella, programma, comando in
   corso e da quanto, ultimo comando con exit code, modello e comando
   dell'agente, l'ultimo messaggio dell'agente (Markdown, troncato a 1500
   caratteri) e, dopo un *Peek*, le ultime righe del pane e gli ultimi scambi
@@ -170,7 +171,7 @@ tern plugin link ./tern-control-room
 ```
 
 Verifica con `tern plugin list`, che deve mostrare
-`control-room 0.3.1 Control Room — 1 blocks, 0 lenses, window  ready`.
+`control-room 0.3.2 Control Room — 1 blocks, 0 lenses, window  ready`.
 Per rimuoverlo: `tern plugin remove control-room` (o `tern plugin unlink control-room`
 se era collegato).
 
