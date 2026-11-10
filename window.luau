@@ -2,12 +2,13 @@
 -- Control Room, window half: reads Tern's own model of this window's sessions,
 -- tabs, panes and agents, pushes it to every Control Room block as a snapshot,
 -- and performs the actions those blocks ask for (go, park/restore, ask an
--- agent for an update, peek at what a pane shows).
+-- agent for an update, peek at what a pane shows, archive an agent, and the
+-- Archive's catalog, search, peek and resume, which `sessions.luau` reads).
 --
 -- Nothing here invents state. Each snapshot is read fresh from `cx.session`
 -- and `cx.agents`; the only things remembered are when a pane last changed
--- (Tern does not report that), the agents asked for an update, and the agents
--- whose last turn failed (`agent_finished`).
+-- (Tern does not report that), the agents asked for an update or a handoff
+-- note, and the agents whose last turn failed (`agent_finished`).
 --
 -- Every window call has a 50 ms budget, and one that runs over disables its
 -- hook (every `timer`, or `route.link`) until the plugin reloads. So each
@@ -16,6 +17,7 @@
 -- request, never in the snapshot.
 
 local common = require("./common")
+local sessions = require("./sessions")
 
 type Row = common.Row
 type Agent = common.Agent
@@ -34,6 +36,14 @@ local CHAT_MESSAGES = 4
 local CHAT_CHARS = 600
 local DEFAULT_ASK =
 	"Status check from Control Room: in a few lines, what have you done so far, what are you doing now, and is anything blocking you or waiting on me?"
+-- How long an agent may take to write its handoff note before archiving gives up.
+local HANDOFF_TIMEOUT_MS = 5 * 60 * 1000
+local HANDOFF_ASK = "]: this session is about to be closed and archived, to be resumed later. "
+	.. "Write a short handoff note, in the language of this conversation, for whoever resumes it: "
+	.. "the goal, what is done, what is left, and anything not committed or saved. "
+	.. "Reply with the note only; do not run tools."
+-- A closing omp releases its session lease shortly after it exits.
+local RELEASE_MS = 2500
 
 -- What changed per pane, keyed by pane id: the fingerprint of what Tern
 -- reports and the times things were seen to change.
@@ -49,6 +59,8 @@ type Seen = {
 	failed_at: number?,
 	--- An update request Control Room sent, until its reply is no longer needed.
 	ask: Ask?,
+	--- When Control Room asked for a handoff note before closing the agent.
+	archiving: number?,
 }
 -- `text` is the prompt sent; `reply` is what `cx.agents:wait` returned when the
 -- turn that answered it ended (the agent's last message then). It stays until a
@@ -159,6 +171,7 @@ local function note(row: Row, now: number)
 	if ask then
 		row.update = { asked_at = ask.at, reply = ask.reply, reply_at = ask.reply_at }
 	end
+	row.archiving = s.archiving
 end
 
 local function control_rooms(cx: WindowCx): { number }
@@ -680,6 +693,77 @@ local function peek(cx: WindowCx, pane: number)
 	end
 end
 
+--- Sends `act` with a JSON body to every Control Room block in this window.
+local function send_all(cx: WindowCx, act: string, body: string)
+	for _, block in control_rooms(cx) do
+		local ok, err = pcall(function()
+			cx.session:event(block, { ev = "action", id = "main", act = act, value = body })
+		end)
+		if not ok then
+			tern.log.warn("control-room: " .. act .. " not delivered", block, err)
+		end
+	end
+end
+
+-- Set once a block has shown the Archive: closing a pane then refreshes it.
+local catalog_wanted = false
+
+local function refresh_catalog(ms: number)
+	tern.timer(ms, function(later: WindowCx?)
+		if later then
+			sessions.catalog(later, send_all)
+		end
+	end)
+end
+
+--- Asks the agent for a handoff note, keeps it for the Archive, then closes the
+--- agent. The block asks first (its confirm strip); a failed request closes nothing.
+local function archive(cx: WindowCx, pane: number)
+	local title = title_of(cx, pane)
+	local s = seen[common.id(pane)]
+	if s and s.archiving then
+		return
+	end
+	local nonce = string.format("%x%04x", os.time(), math.random(0, 0xffff))
+	local ok, err = pcall(function()
+		cx.agents:ask(pane, sessions.HANDOFF_TAG .. nonce .. HANDOFF_ASK)
+	end)
+	if not ok then
+		cx:toast("error", "Could not ask " .. title .. " for a handoff note", tostring(err))
+		return
+	end
+	if s then
+		s.archiving = os.time()
+	end
+	cx:toast("info", "Archiving " .. title, "It closes once it has written its handoff note.")
+	cx.agents:wait(pane, { timeout = HANDOFF_TIMEOUT_MS }):next(function(message: string?, wait_err: string?, later: WindowCx?)
+		local s2 = seen[common.id(pane)]
+		if s2 then
+			s2.archiving = nil
+		end
+		if later == nil then
+			return
+		end
+		local note = if type(message) == "string" then string.match(message, "^%s*(.-)%s*$") else nil
+		if wait_err or note == nil or note == "" then
+			later:toast("error", title .. " was not archived", wait_err or "It wrote no handoff note; the agent stays open.")
+			poke()
+			return
+		end
+		sessions.keep_note(nonce, note)
+		local stopped, stop_err = pcall(function()
+			later.agents:stop(pane)
+		end)
+		if stopped then
+			later:toast("success", "Archived " .. title, "Find it in Control Room's Archive.")
+		else
+			later:toast("error", "Kept the note but could not close " .. title, tostring(stop_err))
+		end
+		poke()
+		refresh_catalog(RELEASE_MS)
+	end)
+end
+
 -- One window acts on each request, even when several show the block.
 local function claim(nonce: string?): boolean
 	if nonce == nil then
@@ -701,6 +785,37 @@ local ACTIONS: { [string]: (WindowCx, number, number?) -> () } = {
 	interrupt = interrupt,
 	pin = pin,
 	new_agent = new_agent,
+	archive = archive,
+}
+
+--- Archive requests: the target is a session id or, for `search`, an encoded query.
+local SESSION_ACTIONS: { [string]: (WindowCx, string?) -> () } = {
+	catalog = function(cx: WindowCx, _target: string?)
+		catalog_wanted = true
+		sessions.catalog(cx, send_all)
+	end,
+	search = function(cx: WindowCx, target: string?)
+		if target then
+			sessions.search(cx, target, send_all)
+		end
+	end,
+	speek = function(cx: WindowCx, target: string?)
+		if target then
+			sessions.peek(cx, target, send_all)
+		end
+	end,
+	resume = function(cx: WindowCx, target: string?)
+		if target == nil then
+			return
+		end
+		local ok, why = sessions.resume(cx, target)
+		if not ok then
+			cx:toast("error", "Could not resume the session", why)
+			return
+		end
+		-- Once its omp holds the session, it leaves the Archive.
+		refresh_catalog(5000)
+	end,
 }
 
 -- The link handler only checks the request and queues it: the action and the
@@ -719,12 +834,22 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 		poke(true)
 		return { handled = true }
 	end
-	local action = ACTIONS[verb]
-	if action and target then
-		local room = from.pane
+	local room = from.pane
+	local session_action = SESSION_ACTIONS[verb]
+	if session_action then
 		tern.timer(0, function(later: WindowCx?)
 			if later and claim(nonce) then
-				action(later, target, room)
+				session_action(later, target)
+			end
+		end)
+		return { handled = true }
+	end
+	local action = ACTIONS[verb]
+	local pane = if target then tonumber(target) else nil
+	if action and pane then
+		tern.timer(0, function(later: WindowCx?)
+			if later and claim(nonce) then
+				action(later, pane, room)
 			end
 			poke()
 		end)
@@ -833,17 +958,24 @@ for _, name in {
 	"window_start",
 	"focus",
 	"pane_created",
-	"pane_closed",
 	"tab_created",
-	"tab_closed",
 	"command_started",
 	"cwd",
 	"title",
 	"agent_state",
-	"session_ended",
 } do
 	tern.on(name, function(...)
 		poke()
+	end)
+end
+
+-- A closed omp releases its session: it now belongs in the Archive.
+for _, name in { "pane_closed", "tab_closed", "session_ended" } do
+	tern.on(name, function(...)
+		poke()
+		if catalog_wanted then
+			refresh_catalog(RELEASE_MS)
+		end
 	end)
 end
 

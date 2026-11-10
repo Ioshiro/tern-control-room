@@ -10,16 +10,22 @@
 -- Until a window reports, the block lists the host's panes from
 -- `tern.pane.list()` with the little it says.
 --
+-- The Archive view works the same way: the window half reads omp's records of
+-- the closed sessions (`catalog`), searches every prompt on request (`hits`)
+-- and resumes one; the ranking itself is `archive.luau`, here.
+--
 -- The page follows Tern's own apps: a head row, a stats strip, tabs, and in
 -- each view a full-width table beside the selected pane's card.
 
 local common = require("./common")
+local archive = require("./archive")
 local ui = tern.ui
 
 type Row = common.Row
 type Snapshot = common.Snapshot
 type Status = common.Status
 type Peek = common.Peek
+type Ranked = archive.Ranked
 
 type Entry = {
 	row: Row,
@@ -37,7 +43,7 @@ type State = {
 	cx: BlockCx,
 	snap: Snapshot?,
 	received: number?,
-	--- `panes`, `agents` or `failures`.
+	--- `panes`, `agents`, `failures` or `archive`.
 	view: string,
 	filter: string,
 	editing: boolean,
@@ -48,14 +54,36 @@ type State = {
 	peek: Peek?,
 	--- The pane a peek was requested for and not yet answered.
 	peeking: number?,
-	--- A destructive action waiting for the user's confirmation in the dock.
+	--- An action waiting for the user's confirmation in the dock (`interrupt`, `archive`).
 	confirm: { verb: string, pane: number, title: string }?,
 	timer: TimerHandle?,
 	--- The rows in display order, as the last `view` laid them out.
 	order: { Entry },
+	--- The Archive's search text (the panes filter is its own).
+	query: string,
+	catalog: common.Catalog?,
+	index: archive.Index?,
+	catalog_asked: number?,
+	--- Deep-search results, for the words `deep_key` names; `deep_stamp` counts arrivals.
+	deep: archive.Deep?,
+	deep_key: string?,
+	deep_stamp: number,
+	deep_error: string?,
+	--- The words a deep search was last scheduled for, and the request sent for them.
+	deep_wanted: string?,
+	deep_sent: string?,
+	deep_sent_key: string?,
+	search_timer: TimerHandle?,
+	--- The Archive in display order, and what it was ranked for.
+	ranked: { Ranked },
+	rank_key: string?,
+	--- The selected session.
+	scursor: string?,
+	speek: common.SessionPeek?,
+	speeking: string?,
 }
 
-local VIEWS = { "panes", "agents", "failures" }
+local VIEWS = { "panes", "agents", "failures", "archive" }
 local SCOPES = { "all", "attention", "active" }
 local SCOPE_LABEL: { [string]: string } = { all = "All", attention = "Attention", active = "Active" }
 local GROUPS = { "none", "session", "project" }
@@ -64,8 +92,14 @@ local GROUP_LABEL: { [string]: string } = { none = "Flat", session = "Session", 
 local STALE_S = 25
 local TICK_MS = 15000
 local MESSAGE_CHARS = 1500
+-- The Archive is read again when older than this, as the view opens.
+local CATALOG_TTL_S = 120
+-- The deep search starts once typing has paused this long.
+local SEARCH_DELAY_MS = 280
+local ARCHIVE_ROWS = 200
 -- Right-click actions of a pane row; sent lowercased as the action verb.
-local ROW_MENU = { "Go", "Peek", "Ask", "Interrupt", "Pin", "New agent", "Park", "Dismiss" }
+local ROW_MENU = { "Go", "Peek", "Ask", "Interrupt", "Pin", "New agent", "Park", "Archive", "Dismiss" }
+local SESSION_MENU = { "Resume", "Peek", "Copy command" }
 -- Row-menu labels and button acts, as the verbs the window half knows.
 local ACTION_VERBS: { [string]: string } = {
 	go = "go",
@@ -76,7 +110,17 @@ local ACTION_VERBS: { [string]: string } = {
 	["new agent"] = "new_agent",
 	new_agent = "new_agent",
 	park = "park",
+	archive = "archive",
 	dismiss = "dismiss",
+}
+-- Actions that wait for a confirmation in the dock.
+local CONFIRM: { [string]: { head: string, button: string, text: string } } = {
+	interrupt = { head = "Interrupt", button = "Interrupt", text = "Sends Ctrl-C to its current turn; the agent and its block stay open." },
+	archive = {
+		head = "Archive",
+		button = "Archive",
+		text = "Asks it for a short handoff note, then closes it. It stays in the Archive with the note, ready to resume.",
+	},
 }
 
 local KIND_ICON: { [string]: string } = {
@@ -136,10 +180,25 @@ end
 
 -- Asks every window half showing this block to act; the nonce lets only one of them do it.
 local nonce_seq = 0
-local function request(state: State, verb: string, pane: number?)
+local function request(state: State, verb: string, target: (number | string)?)
 	nonce_seq += 1
 	local nonce = string.format("%x%x%x", os.time(), nonce_seq, math.random(0, 0xfffff))
-	state.cx:open(common.url(verb, pane, nonce))
+	state.cx:open(common.url(verb, target, nonce))
+end
+
+--- Why `row` cannot be archived now, nil when it can: an omp agent waiting for a prompt.
+local function archive_blocked(row: Row): string?
+	local agent = row.agent
+	if agent == nil or agent.state == "exited" then
+		return "Only a running agent"
+	elseif row.archiving then
+		return "Already archiving"
+	elseif agent.state ~= "idle" then
+		return "Wait until it is waiting for a prompt"
+	elseif agent.command and not string.find(string.lower(agent.command), "omp", 1, true) then
+		return "Only omp agents keep a session to resume"
+	end
+	return nil
 end
 
 --- Rows from the host's own pane list, used until a window half reports.
@@ -607,6 +666,7 @@ local function detail_card(state: State, entry: Entry?, rows: number): Node
 		sm(if row.floating then "Unpin" else "Pin", "pin", { icon = "pin", keys = { "f" }, on = row.floating == true, disabled = offline }),
 		sm("New agent", "new_agent", { icon = "sparkle", keys = { "n" }, disabled = offline or (if row.cwd ~= "" then nil else "No known directory") }),
 		sm(if row.parked then "Restore" else "Park", "park", { icon = "stack", keys = { "p" }, disabled = offline }),
+		sm("Archive", "archive", { icon = "archive", keys = { "a" }, disabled = offline or archive_blocked(row) }),
 		sm("Dismiss", "dismiss", { icon = "check", keys = { "x" }, disabled = if has_problem then nil else "Nothing to dismiss on this pane" }),
 	}))
 	local update = if agent then row.update else nil
@@ -697,25 +757,49 @@ local function nav(state: State, total: number, counts: Counts): Node
 	local function tab(id: string, label: string, count: number): { [string]: any }
 		return { id = id, label = { ui.span(label .. " "), ui.span(tostring(count), "muted") } }
 	end
+	local archived = if state.catalog then #state.catalog.sessions else nil
 	return ui.node("tabs", { key = "nav", active = state.view, items = {
 		tab("panes", "Panes", total),
 		tab("agents", "Agents", counts.agents),
 		tab("failures", "Failures", fails),
+		{ id = "archive", label = { ui.span("Archive "), ui.span(if archived then tostring(archived) else "…", "muted") } },
 	} })
 end
 
 local function toolbar(state: State): Node
+	local archive_view = state.view == "archive"
+	local text = if archive_view then state.query else state.filter
 	local filter = ui.node("input", {
 		key = "filter",
-		text = state.filter,
-		cursor = #state.filter,
-		placeholder = "Filter panes",
+		text = text,
+		cursor = #text,
+		placeholder = if archive_view then "Search titles, notes, recaps and every prompt you sent" else "Filter panes",
 		icon = "search",
 		keys = { "/" },
 		clear = true,
-		max = { w = "40ch" },
+		max = { w = if archive_view then "64ch" else "40ch" },
 		grow = 1,
 	})
+	if archive_view then
+		local meta: { Span } = {}
+		local catalog = state.catalog
+		if catalog then
+			table.insert(meta, ui.span(#state.ranked .. " of " .. #catalog.sessions, "muted"))
+			if catalog.open > 0 then
+				table.insert(meta, ui.span(" · " .. catalog.open .. " open elsewhere", "muted"))
+			end
+			if not catalog.lease then
+				table.insert(meta, ui.span(" · open sessions not checked", "warning"))
+			end
+		end
+		if state.deep_sent and state.deep_key ~= state.deep_sent_key then
+			table.insert(meta, ui.span(" · searching prompts…", "info"))
+		end
+		return ui.node("row", { key = "bar", justify = "between", align = "center", gap = "md" }, {
+			filter,
+			ui.node("text", { key = "end", spans = meta, lines = 1 }),
+		})
+	end
 	local function seg(key: string, active: string, list: { string }, labels: { [string]: string }): Node
 		local items = {}
 		for _, v in list do
@@ -761,6 +845,261 @@ local function pane_lists(state: State, groups: { Group }): Node
 	return ui.node("col", { key = "table", gap = "md" }, sections)
 end
 
+-- The Archive ---------------------------------------------------------------
+
+--- The search words as one key, to tell which results belong to which words.
+local function terms_key(terms: { string }): string
+	return table.concat(terms, " ")
+end
+
+local function ask_catalog(state: State)
+	state.catalog_asked = os.time()
+	request(state, "catalog", nil)
+end
+
+--- Schedules the deep search for the current words, once typing pauses.
+local function schedule_deep(state: State)
+	local index = state.index
+	local terms = common.terms(state.query)
+	local key = terms_key(terms)
+	if index == nil or #terms == 0 or key == state.deep_wanted then
+		return
+	end
+	state.deep_wanted = key
+	if state.search_timer then
+		state.search_timer:cancel()
+	end
+	state.search_timer = tern.timer(SEARCH_DELAY_MS, function()
+		state.search_timer = nil
+		if running[state.cx.pane] ~= state or terms_key(common.terms(state.query)) ~= key then
+			return
+		end
+		local body = tern.json.encode(archive.variants(index, terms))
+		state.deep_sent = body
+		state.deep_sent_key = key
+		request(state, "search", tern.base64.encode(body, { url = true }))
+		state.cx:render()
+	end)
+end
+
+--- The Archive in display order for the current words; ranked again only when they or the data change.
+local function ranked(state: State): { Ranked }
+	local index = state.index
+	if index == nil then
+		state.ranked = {}
+		return state.ranked
+	end
+	local terms = common.terms(state.query)
+	local key = terms_key(terms)
+	local deep = if state.deep_key == key then state.deep else nil
+	local rank_key = key .. "\0" .. (if deep then tostring(state.deep_stamp) else "-")
+	if state.rank_key ~= rank_key then
+		state.rank_key = rank_key
+		state.ranked = archive.rank(index, terms, deep)
+	end
+	return state.ranked
+end
+
+local function selected_session(state: State): Ranked?
+	for _, r in state.ranked do
+		if r.doc.s.id == state.scursor then
+			return r
+		end
+	end
+	return nil
+end
+
+--- `text` with each search word in bold, matched without case or accents (prompts snippets come marked).
+local function marked(text: string, terms: { string }, tone: string): { Span }
+	local out: { Span } = {}
+	if string.find(text, "\2", 1, true) then
+		for plain, hit in string.gmatch(text .. "\2\3", "([^\2]*)\2([^\3]*)\3") do
+			if plain ~= "" then
+				table.insert(out, ui.span(plain, tone))
+			end
+			if hit ~= "" then
+				table.insert(out, ui.span(hit :: string, "strong"))
+			end
+		end
+		return out
+	end
+	local folded = common.fold(text)
+	-- Folding keeps byte offsets only for ASCII; otherwise show it plain.
+	if #folded ~= #text or #terms == 0 then
+		return { ui.span(text, tone) }
+	end
+	local at = 1
+	while at <= #text do
+		local best_s, best_e = nil :: number?, nil :: number?
+		for _, t in terms do
+			local s, e = string.find(folded, t, at, true)
+			if s and (best_s == nil or s < best_s) then
+				best_s, best_e = s, e
+			end
+		end
+		if best_s == nil or best_e == nil then
+			table.insert(out, ui.span(string.sub(text, at), tone))
+			break
+		end
+		if best_s > at then
+			table.insert(out, ui.span(string.sub(text, at, best_s - 1), tone))
+		end
+		table.insert(out, ui.span(string.sub(text, best_s, best_e), "strong"))
+		at = best_e + 1
+	end
+	return out
+end
+
+--- What a session row says about where it stood: the snippet that matched, else its note, recap or last prompt.
+local function gist(r: Ranked): (string?, string)
+	local s = r.doc.s
+	if r.snippet then
+		return r.snippet, "prompt"
+	elseif s.note then
+		return s.note, "note"
+	elseif s.recap then
+		return s.recap, "recap"
+	end
+	return s.prompt, "prompt"
+end
+
+local function session_label(s: common.Session): string
+	return common.clip(s.title or s.prompt or s.id, 80)
+end
+
+local ARCHIVE_COLS: { Col } = {
+	{ id = "name", head = "Session", grow = 1, priority = 9 },
+	{ id = "project", head = "Project", priority = 6, truncate = "middle" },
+	{ id = "last", head = "Where it stood", grow = 1, priority = 7 },
+	{ id = "age", head = "Age", align = "end", mono = true, priority = 8 },
+}
+
+local function archive_table(state: State, list: { Ranked }): Node
+	local terms = common.terms(state.query)
+	local rows: { any } = {}
+	for i, r in list do
+		if i > ARCHIVE_ROWS then
+			break
+		end
+		local s = r.doc.s
+		local text, from = gist(r)
+		local last: { Span } = {}
+		if text then
+			if from == "note" then
+				table.insert(last, ui.span("note: ", "info"))
+			end
+			for _, sp in marked(common.clip(text, 90), terms, "muted") do
+				table.insert(last, sp)
+			end
+		end
+		table.insert(rows, {
+			id = "s" .. s.id,
+			menu = SESSION_MENU,
+			title = s.cwd,
+			cells = {
+				name = { text = marked(session_label(s), terms, ""), icon = if s.note then "archive" else "sparkle", tone = "muted" },
+				project = marked(r.doc.project, terms, "muted"),
+				last = last,
+				age = { ui.span(common.ago(s.at), "muted") },
+			},
+		})
+	end
+	local empty = if state.catalog == nil
+		then "Reading omp's sessions…"
+		elseif state.query ~= "" then "No closed session matches every word"
+		else "No closed sessions"
+	return ui.node("table", {
+		key = "table",
+		cols = ARCHIVE_COLS,
+		rows = rows,
+		selectable = true,
+		selected = if state.scursor then "s" .. state.scursor else nil,
+		empty = { ui.span(empty, "muted") },
+	})
+end
+
+local function said_nodes(key: string, head: string, list: { common.Said }?, md: boolean): { Node }
+	local out: { Node } = {}
+	if list == nil or #list == 0 then
+		return out
+	end
+	table.insert(out, with(ui.rule(head), { key = key .. "-rule" }))
+	for i, said in list do
+		table.insert(out, with(ui.text({ ui.span(common.ago(said.at) .. " ago", "strong muted") }), { key = key .. "-at" .. i }))
+		table.insert(out, with(if md then ui.md(said.text) else ui.text({ ui.span(said.text) }), { key = key .. i }))
+	end
+	return out
+end
+
+local function session_card(state: State, r: Ranked?, rows: number): Node
+	local props: { [string]: any } = { key = "detail", role = "control-room.card", min = { w = "44ch" }, max = { w = "60ch" } }
+	if r == nil then
+		return ui.card("No session selected", { ui.text({ ui.span("Select a closed session to see where it stood", "muted") }) }, props)
+	end
+	local s = r.doc.s
+	local terms = common.terms(state.query)
+	local offline = if state.snap ~= nil and os.time() - (state.received or 0) <= STALE_S then nil else "Control Room is not getting updates from the window"
+	local facts: { { Spans } } = {}
+	local function fact(k: string, v: Spans)
+		table.insert(facts, { k :: Spans, v })
+	end
+	if s.cwd then
+		fact("directory", { ui.path(s.cwd) })
+	end
+	fact("last activity", common.ago(s.at) .. " ago")
+	fact("prompts", tostring(s.prompts))
+	fact("session", { ui.span(s.id, "mono muted") })
+	local children: { Node } = {}
+	table.insert(children, ui.node("row", { key = "end", gap = "sm" }, {
+		ui.button("Resume", { key = "resume", variant = "primary", size = "sm", keys = { "enter" }, disabled = offline, actions = { click = "resume" } }),
+	}))
+	local body: { Node } = {}
+	table.insert(body, with(ui.kv(facts), { key = "facts" }))
+	table.insert(body, ui.node("row", { key = "actions", gap = "sm", wrap = true }, {
+		sm("Peek", "speek", { icon = "eye", keys = { "." }, busy = state.speeking == s.id, disabled = offline }),
+		sm("Copy command", "copy", { icon = "copy", keys = { "c" } }),
+	}))
+	if r.snippet then
+		table.insert(body, with(ui.rule("Matching prompt"), { key = "snip-rule" }))
+		table.insert(body, with(ui.text(marked(r.snippet, terms, "")), { key = "snip" }))
+	end
+	if s.note then
+		table.insert(body, with(ui.rule("Handoff note · " .. common.ago(s.note_at) .. " ago"), { key = "note-rule" }))
+		table.insert(body, with(ui.md(s.note), { key = "note" }))
+	end
+	local peek = state.speek
+	if peek and peek.id == s.id then
+		if peek.error then
+			table.insert(body, with(ui.text({ ui.span(peek.error, "error") }), { key = "speek-err" }))
+		end
+		for _, n in said_nodes("recaps", "omp's recaps", peek.recaps, true) do
+			table.insert(body, n)
+		end
+		for _, n in said_nodes("prompts", "Your last prompts", peek.prompts, false) do
+			table.insert(body, n)
+		end
+	else
+		if s.recap then
+			table.insert(body, with(ui.rule("omp's last recap" .. (if s.recap_at then " · " .. common.ago(s.recap_at) .. " ago" else "")), { key = "recap-rule" }))
+			table.insert(body, with(ui.md(s.recap), { key = "recap" }))
+		end
+		if s.prompt then
+			table.insert(body, with(ui.rule("Your last prompt"), { key = "prompt-rule" }))
+			table.insert(body, with(ui.text(marked(common.cut(s.prompt, 300), terms, "")), { key = "prompt" }))
+		end
+	end
+	local cap = math.max(4, math.floor((rows * 16 - 275) / 18))
+	table.insert(children, ui.node("scroll", { key = "body", role = "control-room.scroll", variant = "fade", gap = "sm", max = { h = cap .. "lines" } }, body))
+	props.icon = if s.note then "archive" else "sparkle"
+	props.meta = r.doc.project .. " · closed"
+	props["end"] = "main.archive.body.detail.end"
+	return ui.card(session_label(s), children, props)
+end
+
+local function resume_command(s: common.Session): string
+	return "omp --resume " .. s.id
+end
+
 local function view(state: State, cx: BlockCx): BlockView
 	local groups, counts, total = layout(state)
 	local order = flatten(groups)
@@ -783,7 +1122,35 @@ local function view(state: State, cx: BlockCx): BlockView
 		return ui.node("scroll", { key = key, role = "control-room.scroll", gap = "md", max = { h = lines .. "lines" } }, children)
 	end
 	local page: Node
-	if state.view == "failures" then
+	if state.view == "archive" then
+		if state.catalog == nil or os.time() - (state.catalog_asked or 0) > CATALOG_TTL_S then
+			if state.catalog_asked == nil or os.time() - state.catalog_asked > 5 then
+				ask_catalog(state)
+			end
+		end
+		schedule_deep(state)
+		local list_rows = ranked(state)
+		if selected_session(state) == nil then
+			state.scursor = if list_rows[1] then list_rows[1].doc.s.id else nil
+		end
+		if state.speek and state.speek.id ~= state.scursor then
+			state.speek = nil
+		end
+		local notes: { Node } = {}
+		local catalog = state.catalog
+		local problem = if catalog and catalog.error then catalog.error else state.deep_error
+		if problem then
+			table.insert(notes, ui.node("text", { key = "problem", spans = { ui.span(common.clip(problem, 200), "warning") } }))
+		end
+		local list = ui.node("col", { key = "list", gap = "md", grow = 1, basis = 0, min = { w = "60ch" } }, {
+			toolbar(state),
+			ui.node("col", { key = "notes" }, notes),
+			scroller("scroll", { archive_table(state, list_rows) }),
+		})
+		page = ui.node("col", { key = "archive" }, {
+			ui.node("row", { key = "body", gap = "lg", align = "start", wrap = true }, { list, session_card(state, selected_session(state), cx.rows) }),
+		})
+	elseif state.view == "failures" then
 		page = ui.node("col", { key = "failures", gap = "md" }, {
 			ui.node("text", { key = "about", spans = { ui.span("Commands that ended with a nonzero exit, as this window saw them finish; newest first. Right-click a row to go to its pane.", "muted") } }),
 			scroller("scroll", { failures_table(state) }),
@@ -813,18 +1180,28 @@ local function view(state: State, cx: BlockCx): BlockView
 	local dock: { Node } = {}
 	local confirm = state.confirm
 	if confirm then
+		local what = CONFIRM[confirm.verb]
 		hint("⏎", "confirm")
 		hint("esc", "cancel")
-		table.insert(dock, ui.node("card", { key = "confirm", tone = "error", icon = "warn", head = "Interrupt " .. confirm.title .. "?", ["end"] = "dock.confirm.end" }, {
+		table.insert(dock, ui.node("card", { key = "confirm", tone = if confirm.verb == "archive" then "warning" else "error", icon = "warn", head = what.head .. " " .. confirm.title .. "?", ["end"] = "dock.confirm.end" }, {
 			ui.node("row", { key = "end", gap = "sm" }, {
 				ui.button("Cancel", { key = "cancel", variant = "quiet", size = "sm", keys = { "esc" }, actions = { click = "cancel" } }),
-				ui.button("Interrupt", { key = "ok", variant = "danger", size = "sm", keys = { "enter" }, actions = { click = "confirm" } }),
+				ui.button(what.button, { key = "ok", variant = if confirm.verb == "archive" then "primary" else "danger", size = "sm", keys = { "enter" }, actions = { click = "confirm" } }),
 			}),
-			ui.text({ ui.span("Sends Ctrl-C to its current turn; the agent and its block stay open.", "muted") }),
+			ui.text({ ui.span(what.text, "muted") }),
 		}))
 	elseif state.editing then
-		hint("⏎", "keep filter")
+		hint("⏎", if state.view == "archive" then "keep search" else "keep filter")
+		hint("↑↓", "select")
 		hint("esc", "clear")
+	elseif state.view == "archive" then
+		hint("↑↓", "select")
+		hint("⏎", "resume")
+		hint(".", "peek")
+		hint("c", "copy command")
+		hint("/", "search")
+		hint("r", "reload")
+		hint("tab", "view")
 	else
 		hint("↑↓", "select")
 		hint("⏎", "go")
@@ -834,6 +1211,7 @@ local function view(state: State, cx: BlockCx): BlockView
 		hint("f", "pin")
 		hint("n", "new agent")
 		hint("p", "park")
+		hint("a", "archive")
 		hint("x", "dismiss")
 		hint("/", "filter")
 		hint("tab", "view")
@@ -863,6 +1241,20 @@ local function title(state: State): string?
 end
 
 local function move(state: State, delta: number)
+	if state.view == "archive" then
+		local n = math.min(#state.ranked, ARCHIVE_ROWS)
+		if n == 0 then
+			return
+		end
+		local at = 1
+		for i, r in state.ranked do
+			if r.doc.s.id == state.scursor then
+				at = i
+			end
+		end
+		state.scursor = state.ranked[math.clamp(at + delta, 1, n)].doc.s.id
+		return
+	end
 	local n = #state.order
 	if n == 0 then
 		return
@@ -876,7 +1268,43 @@ local function move(state: State, delta: number)
 	state.cursor = state.order[math.clamp(at + delta, 1, n)].row.pane
 end
 
+local function online(state: State): boolean
+	if state.snap == nil or os.time() - (state.received or 0) > STALE_S then
+		state.cx:toast("info", "Control Room is not getting updates from the window", "Run Reload plugins from the palette, then try again.")
+		return false
+	end
+	return true
+end
+
+--- An action on the selected closed session: `resume`, `speek` or `copy`.
+local function act_session(state: State, verb: string)
+	local r = selected_session(state)
+	if r == nil then
+		return
+	end
+	local s = r.doc.s
+	if verb == "copy" then
+		state.cx:copy(resume_command(s))
+		state.cx:toast("success", "Copied", resume_command(s))
+		return
+	end
+	if not online(state) then
+		return
+	end
+	if verb == "speek" then
+		state.speeking = s.id
+	end
+	request(state, verb, s.id)
+end
+
 local function act(state: State, verb: string)
+	if state.view == "archive" then
+		local map: { [string]: string } = { go = "resume", resume = "resume", peek = "speek", speek = "speek", copy = "copy", ["copy command"] = "copy" }
+		if map[verb] then
+			act_session(state, map[verb])
+		end
+		return
+	end
 	local entry = selected(state)
 	if entry == nil then
 		return
@@ -903,8 +1331,7 @@ local function act(state: State, verb: string)
 		request(state, "refresh", nil)
 		return
 	end
-	if state.snap == nil or os.time() - (state.received or 0) > STALE_S then
-		state.cx:toast("info", "Control Room is not getting updates from the window", "Run Reload plugins from the palette, then try again.")
+	if not online(state) then
 		return
 	end
 	local is_agent = row.agent ~= nil and row.agent.state ~= "exited"
@@ -912,8 +1339,15 @@ local function act(state: State, verb: string)
 		state.cx:toast("info", "Only a running agent can be " .. (if verb == "ask" then "asked" else "interrupted"), common.clip(row.title, 60))
 		return
 	end
-	if verb == "interrupt" then
-		-- Confirmed from the dock's strip (Enter or the Interrupt button) before it is sent.
+	if verb == "archive" then
+		local why = archive_blocked(row)
+		if why then
+			state.cx:toast("info", "Cannot archive " .. label_of(row) .. " now", why)
+			return
+		end
+	end
+	if CONFIRM[verb] then
+		-- Confirmed from the dock's strip (Enter or its button) before it is sent.
 		state.confirm = { verb = verb :: string, pane = row.pane, title = label_of(row) }
 		return
 	end
@@ -927,6 +1361,60 @@ local function focus_filter(state: State, on: boolean)
 	state.editing = on
 	local id: any = if on then "main." .. state.view .. ".body.list.bar.filter" else tern.json.null
 	state.cx:frame({ { "focus", id } })
+end
+
+--- The text the search field edits: the Archive's query or the panes filter.
+local function field(state: State): string
+	return if state.view == "archive" then state.query else state.filter
+end
+
+local function set_field(state: State, text: string)
+	if state.view == "archive" then
+		state.query = text
+	else
+		state.filter = text
+	end
+end
+
+--- The session a table row or event item names, from its `s<id>` id.
+local function session_of(item: any): string?
+	return string.match(tostring(item or ""), "^s([%w%-]+)$")
+end
+
+--- A catalog, search result or session peek the window half sent; true when `ev` was one.
+local function archive_event(state: State, ev: UiEvent): boolean
+	if ev.ev ~= "action" or type(ev.value) ~= "string" then
+		return false
+	end
+	local act_name = ev.act
+	if act_name ~= "catalog" and act_name ~= "hits" and act_name ~= "speek" then
+		return false
+	end
+	local ok, value = pcall(tern.json.decode, ev.value)
+	if not ok or type(value) ~= "table" then
+		return true
+	end
+	if act_name == "catalog" and type(value.sessions) == "table" then
+		state.catalog = value :: common.Catalog
+		state.catalog_asked = os.time()
+		state.index = archive.index(value.sessions)
+		-- New data: rank again, and search the prompts again for the current words.
+		state.rank_key, state.deep, state.deep_key, state.deep_wanted = nil, nil, nil, nil
+	elseif act_name == "hits" and type(value.hits) == "table" then
+		-- Only the answer to the last request counts; older ones arrive late.
+		if state.deep_sent and value.query == state.deep_sent then
+			state.deep = archive.deep(value.hits)
+			state.deep_key = state.deep_sent_key
+			state.deep_stamp += 1
+			state.deep_error = value.error
+		end
+	elseif act_name == "speek" and type(value.id) == "string" then
+		state.speek = value :: common.SessionPeek
+		if state.speeking == value.id then
+			state.speeking = nil
+		end
+	end
+	return true
 end
 
 local function start_timer(state: State)
@@ -964,6 +1452,23 @@ local room: BlockDef<State> = {
 			timer = nil,
 			order = {},
 			confirm = nil,
+			query = if type(prefs.query) == "string" then prefs.query else "",
+			catalog = nil,
+			index = nil,
+			catalog_asked = nil,
+			deep = nil,
+			deep_key = nil,
+			deep_stamp = 0,
+			deep_error = nil,
+			deep_wanted = nil,
+			deep_sent = nil,
+			deep_sent_key = nil,
+			search_timer = nil,
+			ranked = {},
+			rank_key = nil,
+			scursor = nil,
+			speek = nil,
+			speeking = nil,
 		}
 		running[cx.pane] = state
 		start_timer(state)
@@ -979,20 +1484,21 @@ local room: BlockDef<State> = {
 		local name = key.name
 		local text = key.text
 		if state.editing then
+			local text_now = field(state)
 			if name == "enter" then
 				focus_filter(state, false)
 			elseif name == "escape" then
-				state.filter = ""
+				set_field(state, "")
 				focus_filter(state, false)
 			elseif name == "backspace" then
-				local n = utf8.len(state.filter) or 0
-				state.filter = if n > 0 then string.sub(state.filter, 1, (utf8.offset(state.filter, n) or 1) - 1) else ""
+				local n = utf8.len(text_now) or 0
+				set_field(state, if n > 0 then string.sub(text_now, 1, (utf8.offset(text_now, n) or 1) - 1) else "")
 			elseif name == "up" or name == "down" then
 				move(state, if name == "up" then -1 else 1)
 			elseif name == "paste" and text then
-				state.filter ..= (string.gsub(text, "%s+", " "))
+				set_field(state, text_now .. (string.gsub(text, "%s+", " ")))
 			elseif text and text ~= "" and not key.ctrl and not key.meta then
-				state.filter ..= text
+				set_field(state, text_now .. text)
 			else
 				return false
 			end
@@ -1043,6 +1549,10 @@ local room: BlockDef<State> = {
 			act(state, "pin")
 		elseif press == "n" then
 			act(state, "new_agent")
+		elseif press == "a" and state.view ~= "archive" then
+			act(state, "archive")
+		elseif press == "c" and state.view == "archive" then
+			act(state, "copy")
 		elseif press == "/" then
 			focus_filter(state, true)
 		elseif name == "tab" or press == "]" then
@@ -1054,15 +1564,22 @@ local room: BlockDef<State> = {
 		elseif press == "g" then
 			state.group = cycle(GROUPS, state.group)
 		elseif press == "r" then
-			request(state, "refresh", nil)
-		elseif name == "escape" and state.filter ~= "" then
-			state.filter = ""
+			if state.view == "archive" then
+				ask_catalog(state)
+			else
+				request(state, "refresh", nil)
+			end
+		elseif name == "escape" and field(state) ~= "" then
+			set_field(state, "")
 		else
 			return false
 		end
 		return true
 	end,
 	event = function(state: State, ev: UiEvent, _cx: BlockCx)
+		if archive_event(state, ev) then
+			return
+		end
 		if ev.ev == "action" and ev.act == "snapshot" then
 			local ok, snap = pcall(tern.json.decode, ev.value)
 			if ok and type(snap) == "table" and type(snap.rows) == "table" then
@@ -1099,6 +1616,14 @@ local room: BlockDef<State> = {
 			return
 		end
 		if ev.ev == "select" or ev.ev == "activate" then
+			local sid = session_of(ev.item)
+			if sid then
+				state.scursor = sid
+				if ev.ev == "activate" then
+					act(state, "resume")
+				end
+				return
+			end
 			local pane = pane_of(ev.item)
 			if pane then
 				state.cursor = pane
@@ -1109,11 +1634,15 @@ local room: BlockDef<State> = {
 			return
 		end
 		if ev.ev == "action" and ev.act == "clear" then
-			state.filter = ""
+			set_field(state, "")
 			return
 		end
 		if ev.ev == "action" and ev.act == "refresh" then
-			request(state, "refresh", nil)
+			if state.view == "archive" then
+				ask_catalog(state)
+			else
+				request(state, "refresh", nil)
+			end
 			return
 		end
 		if ev.ev == "action" then
@@ -1127,6 +1656,14 @@ local room: BlockDef<State> = {
 				else
 					state.confirm = nil
 				end
+				return
+			end
+			local sid = session_of(ev.item)
+			if sid or verb == "resume" or verb == "speek" or verb == "copy" or verb == "copy command" then
+				if sid then
+					state.scursor = sid
+				end
+				act(state, verb)
 				return
 			end
 			if ACTION_VERBS[verb] then
@@ -1145,7 +1682,7 @@ local room: BlockDef<State> = {
 		end
 	end,
 	save = function(state: State): any
-		return { view = state.view, filter = state.filter, scope = state.scope, group = state.group }
+		return { view = state.view, filter = state.filter, scope = state.scope, group = state.group, query = state.query }
 	end,
 }
 

@@ -4,11 +4,15 @@ Un blocco Tern persistente per rientrare nei lavori paralleli: una pagina con
 tutti i pane delle sessioni di questa finestra (terminali, agenti, blocchi),
 con lo stato che Tern riporta, ordinati per **attenzione prima** e **attività
 recente dopo**. Da lì salti al pane, sbirci le sue ultime righe, chiedi un
-aggiornamento a un agente, parcheggi o ripristini un pane.
+aggiornamento a un agente, parcheggi o ripristini un pane. L'**Archivio**
+elenca le sessioni omp chiuse, con ricerca in tutti i prompt che hai scritto,
+e le riapre: puoi chiudere gli agenti che non usi senza perdere il filo.
 
-Non è un gestore di TODO: non salva elenchi, note o riepiloghi. Ogni riga è
-letta da Tern a ogni aggiornamento; i messaggi degli agenti sono il loro ultimo
-messaggio reale, non riassunti.
+Non è un gestore di TODO: non salva elenchi o riepiloghi propri. Ogni riga è
+letta da Tern (o dai registri di omp, per l'Archivio) a ogni aggiornamento; i
+messaggi degli agenti sono il loro ultimo messaggio reale, non riassunti.
+L'unica cosa che scrive è la nota di passaggio che un agente lascia quando lo
+archivi.
 
 ## La pagina
 
@@ -29,7 +33,8 @@ Pane · Where · Status · Last · Age              ┌ pane selezionato        
   attesa di input, falliti), quanti lavorano (agenti, comandi), quanti aspettano
   un prompt, quanti sono inattivi.
 - **Viste**: *Panes* (tutti), *Agents* (solo i pane con un agente), *Failures*
-  (i comandi falliti visti da questa finestra, vedi sotto).
+  (i comandi falliti visti da questa finestra, vedi sotto), *Archive* (le
+  sessioni omp chiuse, vedi sotto).
 - **Tabella**: un punto colorato per stato, titolo, sessione › tab (o *parked*),
   stato, ultimo risultato (ultimo comando con esito e durata, oppure l'ultimo
   messaggio dell'agente) e da quanto è cambiata. Le colonne meno importanti si
@@ -67,12 +72,16 @@ urgente va in alto).
 | `f` | pin: pane in picture-in-picture sopra Control Room / rimettilo a posto |
 | `n` | nuovo agente nella cartella del pane selezionato |
 | `p` | parcheggia il pane / ripristinalo (resta a fuoco Control Room) |
+| `a` | archivia l'agente: nota di passaggio, poi chiusura (con conferma) |
 | `x` | archivia il problema della riga (vedi sotto) |
 | `/` | filtra: digita, `Enter` conferma, `Esc` cancella |
-| `Tab`/`⇧Tab` (`]`/`[`) | vista: Panes → Agents → Failures |
+| `Tab`/`⇧Tab` (`]`/`[`) | vista: Panes → Agents → Failures → Archive |
 | `v` | ambito: tutto → richiede attenzione → non inattivo |
 | `g` | raggruppa: nessuno → per sessione → per progetto |
-| `r` | aggiorna ora |
+| `r` | aggiorna ora (nell'Archivio: rilegge le sessioni) |
+
+Nell'Archivio `Enter` (o doppio clic) riprende la sessione, `.` ne mostra gli
+ultimi prompt e recap, `c` copia `omp --resume <id>`, `/` cerca.
 
 Gli stessi comandi sono pulsanti nella scheda, nei tab e nel menu del tasto
 destro della riga. Il filtro cerca, parola per parola, in titolo, cartella,
@@ -129,6 +138,54 @@ nella cartella del pane selezionato (`cx.agents:start`).
 ancora aperti. Stanno nel `kv.json` (chiave `failures`), quindi sopravvivono
 al reload. Il tasto destro su una riga porta al pane o ne fa il peek.
 
+## Archivio
+
+Le sessioni omp che nessun omp tiene aperte, dalla più recente: titolo,
+progetto, dove era rimasta (la nota di passaggio, altrimenti l'ultimo recap di
+omp, altrimenti il tuo ultimo prompt) e da quanto. La scheda mostra cartella,
+numero di prompt, nota, recap e ultimo prompt; *Peek* aggiunge gli ultimi 6
+prompt e 3 recap.
+
+I dati sono quelli che omp tiene già, letti in sola lettura: `history.db`
+(titoli, recap, ogni prompt con la sua sessione) e i nomi dei file in
+`sessions/`. Una sessione è *aperta* se un omp ne tiene il lease
+(`omp session lease`) o se un pane di Tern la mostra (`tern inspect`); quelle
+restano fuori e la barra dice quante sono. L'elenco si rilegge quando apri la
+vista (al più ogni 2 minuti), con `r` e quando si chiude un pane.
+
+**Riprendere (`Enter`)** apre un tab nella cartella della sessione con
+`omp --resume <file>`. Il resto lo fa omp: se la sessione è stata ripresa
+altrove, omp apre la copia più recente.
+
+**Archiviare (`a`, nella vista Panes)** chiede conferma, poi chiede all'agente
+una breve nota di passaggio (obiettivo, cosa è fatto, cosa resta, cosa non è
+committato), la salva nel `kv.json` del plugin (chiave `notes`, le ultime 300)
+e chiude l'agente con `cx.agents:stop`. Vale solo per un agente omp in attesa
+di un prompt. Se non risponde entro 5 minuti, o la risposta è vuota, l'agente
+resta aperto. La nota si lega alla sessione tramite il prompt di richiesta,
+che porta un tag `[cr-<nonce>]` e finisce in `history.db` con l'id della
+sessione.
+
+**Cercare (`/`)** combina due livelli:
+
+1. *Istantaneo*, a ogni tasto: le sessioni sono indicizzate una volta per
+   elenco (titolo, progetto, cartella, nota, recap, ultimo prompt, tutto in
+   minuscolo e senza accenti). Una parola vale per il campo migliore in cui
+   compare (titolo 8, progetto 6, nota 5, recap 3, cartella e prompt 2), di
+   più a inizio parola che dentro una parola. Se non compare, una variante
+   con 1 errore (2 da 8 lettere) di una parola di titolo, progetto o nota vale
+   meno.
+2. *Profondo*, dopo 280 ms senza tasti: la finestra cerca in **tutti** i
+   prompt che hai mai scritto con l'indice FTS5 di omp (`history_fts`, BM25,
+   prefisso) e in tutti i recap. Una parola che non inizia nessuna parola
+   dell'elenco viene cercata anche con le 3 più vicine (distanza di
+   Levenshtein), così `swager` trova `swagger`. Il frammento del prompt
+   trovato compare nella riga e nella scheda, con le parole in grassetto.
+
+Ogni parola deve comparire da qualche parte (in uno dei due livelli); a parità
+conta la recenza (dimezza ogni 14 giorni). Una ricerca su 3000 prompt e 570
+sessioni richiede qualche decina di millisecondi, fuori dal thread della UI.
+
 **Fuori dal blocco**: finché qualche pane richiede attenzione, il titolo
 della finestra inizia con `⚠ N` e la barra di stato (se attiva) mostra un
 segmento `N need attention` che apre Control Room al clic.
@@ -171,7 +228,7 @@ tern plugin link ./tern-control-room
 ```
 
 Verifica con `tern plugin list`, che deve mostrare
-`control-room 0.3.2 Control Room — 1 blocks, 0 lenses, window  ready`.
+`control-room 0.4.0 Control Room — 1 blocks, 0 lenses, window  ready`.
 Per rimuoverlo: `tern plugin remove control-room` (o `tern plugin unlink control-room`
 se era collegato).
 
@@ -181,7 +238,8 @@ se era collegato).
 window.luau (in ogni finestra)               host.luau (nel daemon)
   legge cx.session, cx.sessions,  ── snapshot ─▶  blocco "room": viste, filtro,
   cx.agents a ogni evento e ogni 5 s   ── peek ──▶  ordinamento, pagina
-  esegue go / park / ask / peek / pin … ◀── control-room://<azione>/<pane> ──
+  sessions.luau: history.db, lease  ── catalog/hits ─▶  archive.luau: indice, ranking
+  esegue go / park / ask / peek / pin … ◀── control-room://<azione>/<pane|sessione> ──
 ```
 
 Il blocco gira nel daemon, che conosce solo titolo, cartella e "busy" dei
@@ -194,13 +252,17 @@ metà finestra del plugin, che quindi:
    blocco come evento di vista; il blocco tiene solo l'ultimo;
 2. riceve le azioni dal blocco come link `control-room://…`, accettati solo
    se vengono da un blocco Control Room, e li esegue una volta sola anche con
-   più finestre aperte; un *peek* risponde con un secondo evento di vista.
+   più finestre aperte; un *peek* risponde con un secondo evento di vista;
+3. per l'Archivio interroga `history.db` con `cx.db` (sola lettura, fuori dal
+   thread della UI) e chiede i lease a `omp session lease`; la ricerca
+   profonda arriva come parole già scelte dal blocco, codificate in base64.
 
 Lo stato tenuto dalla finestra è: quando ha visto cambiare un pane (Tern non
-lo riporta), quale agente ha avuto l'ultimo turno fallito, e la richiesta
-di aggiornamento in corso con la sua risposta; si azzera al reload. Senza
-snapshot da più di 25 secondi il blocco lo segnala; finché nessuna finestra
-ha riferito, mostra solo ciò che sa il daemon.
+lo riporta), quale agente ha avuto l'ultimo turno fallito, la richiesta
+di aggiornamento in corso con la sua risposta e gli agenti in archiviazione;
+si azzera al reload. Senza snapshot da più di 25 secondi il blocco lo
+segnala; finché nessuna finestra ha riferito, mostra solo ciò che sa il
+daemon.
 
 ## Limiti noti
 
@@ -218,19 +280,31 @@ ha riferito, mostra solo ciò che sa il daemon.
   (`last_message`); la chat del *peek* viene da `cx.agents:transcript`, che
   per gli agenti non omp è vuota. I messaggi di soli tool call compaiono come
   `(N tool calls, no text)`.
+- L'Archivio legge lo schema interno di `history.db` di omp (`history`,
+  `history_fts`, `session_titles`, `session_recaps`): un aggiornamento di omp
+  che lo cambia mostra l'errore nella vista invece dell'elenco. Elenca solo
+  le sessioni che hanno almeno un prompt o un recap registrato e il cui file
+  esiste ancora; il percorso dei dati è `PI_CODING_AGENT_DIR`, altrimenti
+  `~/.omp/agent`.
+- La ricerca istantanea mette in grassetto le parole solo nei testi ASCII
+  (quelli con lettere accentate restano senza evidenza); il frammento della
+  ricerca profonda è sempre evidenziato.
 
 ## Sviluppo
 
 - `host.luau`: il blocco (pagina, viste, tasti, filtri, ordinamento).
+- `archive.luau`: indice e ranking dell'Archivio (lato blocco).
 - `window.luau`: snapshot, peek, azioni, comando di palette e tasto.
-- `common.luau`: tipi dello snapshot e del peek, classificazione degli stati,
-  utilità.
+- `sessions.luau`: elenco, lease, ricerca, peek e ripresa delle sessioni
+  chiuse; note di passaggio (lato finestra).
+- `common.luau`: tipi dello snapshot, del peek e dell'Archivio,
+  classificazione degli stati, parole di ricerca, utilità.
 
 Controllo dei tipi con [luau-lsp](https://github.com/JohnnyMorganz/luau-lsp):
 
 ```sh
 tern plugin types .
-luau-lsp analyze --platform=standard --definitions=@tern=tern.d.luau host.luau window.luau common.luau
+luau-lsp analyze --platform=standard --definitions=@tern=tern.d.luau host.luau window.luau common.luau sessions.luau archive.luau
 ```
 
 `dev/` contiene due aiuti per provarlo senza agenti o shell reali:

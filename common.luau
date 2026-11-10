@@ -1,12 +1,14 @@
 --!strict
 -- Shared by both halves: the block kind, the snapshot the window half sends
--- to the block, how a row is classified, and the link scheme the block uses
--- to ask the window half for actions.
+-- to the block, how a row is classified, the link scheme the block uses to
+-- ask the window half for actions, and the Archive's types and search words.
 --
 -- Data flows one way each:
---   window -> block: `cx.session:event(block, {ev = "action", act = "snapshot", value = json})`
---   block -> window: `cx:open("control-room://<verb>[/<pane>[/<nonce>]]")`, claimed by
---                    the window half's `tern.route.link`.
+--   window -> block: `cx.session:event(block, {ev = "action", act = <what>, value = json})`
+--                    (`snapshot`, `peek`, `catalog`, `hits`, `speek`)
+--   block -> window: `cx:open("control-room://<verb>[/<target>[/<nonce>]]")`, claimed by
+--                    the window half's `tern.route.link`; the target is a pane id, an omp
+--                    session id or a URL-safe base64 search query.
 
 local common = {}
 
@@ -61,6 +63,8 @@ export type Row = {
 	--- The update Control Room asked the agent for, while its reply is worth showing:
 	--- from the request until a later turn ends with something newer than the reply.
 	update: Update?,
+	--- When Control Room asked the agent for a handoff note before closing it (`archive`).
+	archiving: number?,
 }
 
 --- `reply` is the agent's own text, as its transcript (or last message) holds it.
@@ -90,6 +94,41 @@ export type Peek = {
 	error: string?,
 }
 
+--- One omp session no running omp holds, as `history.db` and the session files report it.
+export type Session = {
+	id: string,
+	title: string?,
+	--- The directory of its last prompt (else of its last recap).
+	cwd: string?,
+	--- Last activity: its newest prompt, recap or handoff note (seconds).
+	at: number,
+	--- Prompts recorded for it.
+	prompts: number,
+	--- omp's latest recap of it, clipped.
+	recap: string?,
+	recap_at: number?,
+	--- Its last prompt, clipped.
+	prompt: string?,
+	--- The handoff note the agent wrote when Control Room archived it.
+	note: string?,
+	note_at: number?,
+}
+
+--- The Archive: closed sessions, newest first. `open` counts those left out because an omp
+--- holds them; `lease` is false when that could not be checked (all are listed then).
+export type Catalog = { at: number, sessions: { Session }, open: number, lease: boolean, error: string? }
+
+--- A search hit for word `t` (1-based, in `common.terms` order) in session `s`: `k` is `p`
+--- (your prompts, BM25 weight `w`) or `r` (a recap); `n` counts the hits, `x` is the best
+--- snippet (prompt snippets mark the match with `\2`…`\3`).
+export type Hit = { t: number, s: string, k: string, w: number, n: number, x: string? }
+
+export type Hits = { query: string, hits: { Hit }, error: string? }
+
+export type Said = { text: string, at: number }
+
+--- A closed session's last prompts and recaps, read on request (`control-room://speek/<id>`).
+export type SessionPeek = { id: string, at: number, prompts: { Said }?, recaps: { Said }?, error: string? }
 --- Where a row stands: `attention`, `running`, `waiting` or `idle` (the order rows sort in).
 export type Status = { level: string, rank: number, tone: string, text: string }
 
@@ -100,11 +139,11 @@ function common.id(pane: number): string
 	return string.format("%.0f", pane)
 end
 
---- `control-room://<verb>[/<pane>[/<nonce>]]`.
-function common.url(verb: string, pane: number?, nonce: string?): string
+--- `control-room://<verb>[/<target>[/<nonce>]]`; a numeric target is a pane id.
+function common.url(verb: string, target: (number | string)?, nonce: string?): string
 	local url = common.SCHEME .. verb
-	if pane then
-		url ..= "/" .. common.id(pane)
+	if target ~= nil then
+		url ..= "/" .. (if type(target) == "number" then common.id(target) else target)
 		if nonce then
 			url ..= "/" .. nonce
 		end
@@ -112,16 +151,50 @@ function common.url(verb: string, pane: number?, nonce: string?): string
 	return url
 end
 
---- Verb, target pane and nonce of a control-room link; a nil verb for any other link.
-function common.parse(url: string): (string?, number?, string?)
+--- Verb, target and nonce of a control-room link; a nil verb for any other link.
+function common.parse(url: string): (string?, string?, string?)
 	if string.sub(url, 1, #common.SCHEME) ~= common.SCHEME then
 		return nil, nil, nil
 	end
-	local verb, pane, nonce = string.match(string.sub(url, #common.SCHEME + 1), "^([%a_]+)/?(%d*)/?(%w*)/?$")
+	local verb, target, nonce = string.match(string.sub(url, #common.SCHEME + 1), "^([%a_]+)/?([%w%-_]*)/?(%w*)/?$")
 	if verb == nil then
 		return nil, nil, nil
 	end
-	return verb, if pane ~= "" then tonumber(pane) else nil, if nonce ~= "" then nonce else nil
+	return verb, if target ~= "" then target else nil, if nonce ~= "" then nonce else nil
+end
+
+-- Latin-1 letters with accents (UTF-8 `\xC3` + one byte) and the ASCII letter they fold to.
+local FOLD: { [string]: string } = {}
+for _, r in { { 0x80, 0x85, "a" }, { 0x87, 0x87, "c" }, { 0x88, 0x8B, "e" }, { 0x8C, 0x8F, "i" }, { 0x91, 0x91, "n" }, { 0x92, 0x96, "o" }, { 0x99, 0x9C, "u" }, { 0xA0, 0xA5, "a" }, { 0xA7, 0xA7, "c" }, { 0xA8, 0xAB, "e" }, { 0xAC, 0xAF, "i" }, { 0xB1, 0xB1, "n" }, { 0xB2, 0xB6, "o" }, { 0xB9, 0xBC, "u" } } :: { { any } } do
+	for b = r[1], r[2] do
+		FOLD["\xC3" .. string.char(b)] = r[3]
+	end
+end
+
+--- `s` lowercased, with accented Latin letters folded to plain ones (`Perché` → `perche`).
+function common.fold(s: string): string
+	return (string.gsub(string.lower(s), "\xC3[\x80-\xBF]", FOLD))
+end
+
+--- The words a search looks for: folded, split at anything but letters and digits, without
+--- repeats, at most 8; one-letter words only when there is nothing longer.
+function common.terms(query: string): { string }
+	local out: { string } = {}
+	local short: { string } = {}
+	local seen: { [string]: boolean } = {}
+	for w in string.gmatch(common.fold(query), "[%w\x80-\xFF]+") do
+		if not seen[w] then
+			seen[w] = true
+			table.insert(if #w >= 2 then out else short, w)
+		end
+	end
+	if #out == 0 then
+		out = short
+	end
+	while #out > 8 do
+		table.remove(out)
+	end
+	return out
 end
 
 --- At most `n` characters of `s`, cut at a character boundary, with an ellipsis when cut.
@@ -177,6 +250,9 @@ function common.classify(row: Row, acks: { [string]: string }): Status
 	end
 	local agent = row.agent
 	if agent then
+		if row.archiving then
+			return status("running", "accent", "archiving: writing its handoff note")
+		end
 		if agent.delivery_error then
 			return status("attention", "error", "prompt not delivered: " .. common.clip(agent.delivery_error, 80))
 		elseif agent.state == "waiting_input" then
