@@ -18,23 +18,25 @@ archivi.
 
 ```
 Control Room  18 panes · 7 sessions · updated 3s ago           [Live] [Refresh r]
-Attention 0 │ Running 1 │ Waiting 10 │ Idle 7
-Panes 18   Agents 11   Failures 1
+Attention 0 │ Running 1 │ Waiting 10 │ Idle 7 │ Limits 62%
+Panes 18   Agents 11   Failures 1   Limits 12   Archive 570
 [⌕ filter /]                  [All | Attention | Active] [Flat | Session | Project]
 Pane · Where · Status · Last · Age              ┌ pane selezionato        [Go ⏎] ┐
 …righe…                                         │ fatti · azioni · peek · messaggi │
 ```
 
 - **Testata**: conteggio pane e sessioni, quando è arrivato l'ultimo rapporto
-  dalla finestra; il badge dice `Live`, `Stale` (nessun rapporto da più di 25 s)
-  o `No window report` (nessuna finestra ha ancora riferito: si vede solo ciò
-  che sa il daemon).
+  dalla finestra; il badge dice `Live`, `Stale` (nessun rapporto da più di 25 s),
+  `Paused 4s` (un hook della finestra ha sforato il suo budget di tempo: Tern lo
+  sospende e lo riprende da solo, da 5 s a 5 min) o `No window report` (nessuna
+  finestra ha ancora riferito: si vede solo ciò che sa il daemon).
 - **Strip di numeri**: quanti pane richiedono attenzione (e perché: agenti in
   attesa di input, falliti), quanti lavorano (agenti, comandi), quanti aspettano
-  un prompt, quanti sono inattivi.
+  un prompt, quanti sono inattivi, e i **limiti** dei provider (vedi sotto).
 - **Viste**: *Panes* (tutti), *Agents* (solo i pane con un agente), *Failures*
-  (i comandi falliti visti da questa finestra, vedi sotto), *Archive* (le
-  sessioni omp chiuse, vedi sotto).
+  (i comandi falliti visti da questa finestra, vedi sotto), *Limits* (limiti dei
+  provider e credenziali non in uso, vedi sotto), *Archive* (le sessioni omp
+  chiuse, vedi sotto).
 - **Tabella**: un punto colorato per stato, titolo, sessione › tab (o *parked*),
   stato, ultimo risultato (ultimo comando con esito e durata, oppure l'ultimo
   messaggio dell'agente) e da quanto è cambiata. Le colonne meno importanti si
@@ -43,14 +45,20 @@ Pane · Where · Status · Last · Age              ┌ pane selezionato        
 - **Scheda del pane selezionato**: accanto alla tabella quando ci sta, sotto
   altrimenti. La pagina sta nell'altezza del pane: scorrono solo la tabella e
   il corpo della scheda, non il blocco intero. Mostra cartella, programma, comando in
-  corso e da quanto, ultimo comando con exit code, modello e comando
-  dell'agente, l'ultimo messaggio dell'agente (Markdown, troncato a 1500
-  caratteri) e, dopo un *Peek*, le ultime righe del pane e gli ultimi scambi
-  della chat.
+  corso e da quanto, ultimo comando con esito (`ok`, `exit N` o `interrupted`),
+  modello e comando dell'agente, l'ultimo messaggio dell'agente (Markdown,
+  troncato a 1500 caratteri), per un agente omp l'ultimo recap che omp ha scritto
+  della sua sessione, i **servizi** che quella sessione omp tiene in background
+  (`omp ps`: quelli in corso e quelli finiti da meno di 12 ore, con esito) e, dopo
+  un *Peek*, le ultime righe del pane e gli ultimi scambi della chat.
+- **Nomi**: un pane è chiamato col suo titolo; se il titolo è solo un percorso
+  (`C:\Windows\system32\cmd.exe`) si accorcia al nome del file; se non dice nulla
+  (blocchi file, git, browser, omp ripreso senza titolo) usa il file, la
+  cartella del repository, l'indirizzo o il titolo che omp ha dato alla sessione.
 
 | Stato | Quando |
 | --- | --- |
-| **attenzione** (rosso/ambra) | agente in attesa del tuo input; turno di un agente fallito; turno finito e non ancora visto; prompt non consegnato; ultimo comando fallito; programma uscito con codice ≠ 0; pane che non è partito; alert non visto |
+| **attenzione** (rosso/ambra) | agente in attesa del tuo input; turno di un agente fallito; turno finito e non ancora visto; prompt non consegnato; ultimo comando fallito; programma uscito con codice ≠ 0; pane che non è partito; alert non visto. Un Ctrl-C (exit 130, o `0xC000013A` su Windows) non è un fallimento: la riga resta inattiva e il comando non entra in *Failures* |
 | **in esecuzione** (accent) | agente che lavora; comando in esecuzione (con la riga di comando) |
 | **in attesa** (pending) | agente fermo in attesa di un prompt |
 | **inattivo** (grigio) | tutto il resto |
@@ -73,15 +81,18 @@ urgente va in alto).
 | `n` | nuovo agente nella cartella del pane selezionato |
 | `p` | parcheggia il pane / ripristinalo (resta a fuoco Control Room) |
 | `a` | archivia l'agente: nota di passaggio, poi chiusura (con conferma) |
+| `⇧U` | chiedi a tutti: un messaggio a ogni agente in elenco fermo al prompt |
+| `⇧A` | archivia gli inattivi: ogni agente omp in elenco fermo da più di un'ora (con conferma) |
 | `x` | archivia il problema della riga (vedi sotto) |
-| `/` | filtra: digita, `Enter` conferma, `Esc` cancella |
-| `Tab`/`⇧Tab` (`]`/`[`) | vista: Panes → Agents → Failures → Archive |
+| `/` | filtra: digita, `Enter` conferma, `Esc` cancella; frecce, `Home`/`End` e `Canc` spostano il cursore, il mouse seleziona |
+| `Tab`/`⇧Tab` (`]`/`[`) | vista: Panes → Agents → Failures → Limits → Archive |
 | `v` | ambito: tutto → richiede attenzione → non inattivo |
 | `g` | raggruppa: nessuno → per sessione → per progetto |
-| `r` | aggiorna ora (nell'Archivio: rilegge le sessioni) |
+| `r` | aggiorna ora (in Limits: rilegge i limiti; nell'Archivio: rilegge le sessioni) |
 
-Nell'Archivio `Enter` (o doppio clic) riprende la sessione, `.` ne mostra gli
-ultimi prompt e recap, `c` copia `omp --resume <id>`, `/` cerca.
+Nell'Archivio `Enter` (o doppio clic) riprende la sessione, `⇧R` la riprende
+e fa proseguire il turno interrotto, `.` ne mostra gli ultimi prompt e recap,
+`c` copia `omp --resume <id>`, `/` cerca.
 
 Gli stessi comandi sono pulsanti nella scheda, nei tab e nel menu del tasto
 destro della riga. Il filtro cerca, parola per parola, in titolo, cartella,
@@ -119,6 +130,15 @@ viene lasciata cadere.
 Per cambiare il testo proposto, imposta la chiave `ask_prompt` nel
 `kv.json` del plugin (`<state>/plugin-data/control-room/kv.json`).
 
+**Chiedere a tutti (`⇧U`, *Ask all* nella vista Agents)** apre lo stesso campo
+una volta sola e invia il testo a ogni agente dell'elenco fermo al prompt che
+non deve già una risposta. **Archiviare gli inattivi (`⇧A`, *Archive idle*)**
+archivia, dopo una conferma che dice quanti sono, ogni agente omp dell'elenco
+fermo al prompt da più di 60 minuti (chiave `bulk_idle_minutes` nel
+`kv.json`); ognuno scrive la sua nota e si chiude per conto suo. Entrambe
+agiscono sulle righe che l'elenco mostra: filtro, ambito e raggruppamento
+decidono a chi; i pulsanti ne mostrano il numero.
+
 **Interrompere (`i`)** chiede conferma in una striscia in basso (`Enter`
 conferma, `Esc` annulla) e poi manda Ctrl-C al turno in corso con
 `cx.agents:interrupt`: l'agente e il suo blocco restano aperti.
@@ -138,6 +158,24 @@ nella cartella del pane selezionato (`cx.agents:start`).
 ancora aperti. Stanno nel `kv.json` (chiave `failures`), quindi sopravvivono
 al reload. Il tasto destro su una riga porta al pane o ne fa il peek.
 
+## Limiti dei provider
+
+La vista **Limits** e l'ultima tessera della strip mostrano quello che `omp usage
+--json` riporta: per ogni account di ogni provider le finestre di limite
+(percentuale usata, quando si azzerano) e le **credenziali che omp ha disattivato**
+con la causa (token revocato, refresh fallito). La tessera dice la percentuale
+più alta, o `2 credentials off` se ci sono credenziali disattivate, e diventa
+rossa se un limite è esaurito. `omp usage` impiega alcuni secondi: gira fuori dal
+thread della UI, al caricamento, ogni 10 minuti, a un fine turno fallito (un limite
+esaurito o una credenziale disattivata sono cause comuni) e con `r` nella vista.
+L'ultimo rapporto sta nel `kv.json` (chiave `usage`): il blocco lo mostra subito
+all'avvio.
+
+Un proxy come CLIProxyAPI non compare: con la chiave client di `models.yml` non
+espone nessun limite, e le percentuali di 5 ore e settimanali si leggono solo con
+la sua chiave di gestione, facendo chiamare al proxy gli endpoint privati di
+usage di Anthropic e OpenAI con il token di ogni account.
+
 ## Archivio
 
 Le sessioni omp che nessun omp tiene aperte, dalla più recente: titolo,
@@ -155,7 +193,10 @@ vista (al più ogni 2 minuti), con `r` e quando si chiude un pane.
 
 **Riprendere (`Enter`)** apre un tab nella cartella della sessione con
 `omp --resume <file>`. Il resto lo fa omp: se la sessione è stata ripresa
-altrove, omp apre la copia più recente.
+altrove, omp apre la copia più recente. **Ripristinare (`⇧R`, *Restore*)** fa
+lo stesso con `omp --restore <file>`: omp riprende anche ciò che il suo
+ultimo processo aveva lasciato a metà (il turno interrotto e i subagent che
+stava eseguendo), utile dopo un crash o un riavvio.
 
 **Archiviare (`a`, nella vista Panes)** chiede conferma, poi chiede all'agente
 una breve nota di passaggio (obiettivo, cosa è fatto, cosa resta, cosa non è
@@ -187,7 +228,8 @@ conta la recenza (dimezza ogni 14 giorni). Una ricerca su 3000 prompt e 570
 sessioni richiede qualche decina di millisecondi, fuori dal thread della UI.
 
 **Fuori dal blocco**: finché qualche pane richiede attenzione, il titolo
-della finestra inizia con `⚠ N` e la barra di stato (se attiva) mostra un
+della finestra inizia con `⚠ N`, ogni tab che contiene pane da guardare porta
+`⚠` e il loro numero davanti al nome, e la barra di stato (se attiva) mostra un
 segmento `N need attention` che apre Control Room al clic.
 
 ## Aprirlo
@@ -228,7 +270,7 @@ tern plugin link ./tern-control-room
 ```
 
 Verifica con `tern plugin list`, che deve mostrare
-`control-room 0.4.0 Control Room — 1 blocks, 0 lenses, window  ready`.
+`control-room 0.5.0 Control Room — 1 blocks, 0 lenses, window  ready`.
 Per rimuoverlo: `tern plugin remove control-room` (o `tern plugin unlink control-room`
 se era collegato).
 
@@ -249,13 +291,30 @@ metà finestra del plugin, che quindi:
 1. legge il modello di Tern a ogni evento (fuoco, pane/tab aperti o chiusi,
    comando iniziato/finito, titolo, cartella, stato e fine turno di un agente,
    sessione chiusa) e, come battito, ogni 5 secondi; invia lo snapshot al
-   blocco come evento di vista; il blocco tiene solo l'ultimo;
+   blocco come evento di vista; il blocco tiene solo l'ultimo; uno snapshot non
+   consegnato non conta come inviato e si riprova al giro dopo. L'elenco
+   degli agenti (`cx.agents:list()`, la sola lettura lenta: 25–80 ms) si tiene
+   tra una lettura e l'altra: un agente che inizia un turno (`agent_state`)
+   aggiorna solo lo stato tenuto; si rilegge quando un turno finisce, si apre
+   un pane, dopo un'azione o un *Refresh*, e sul battito: ogni 15 s mentre un
+   agente lavora e un Control Room è nel tab a fuoco (l'ultimo messaggio di
+   un agente al lavoro può restare indietro di 15 s), ogni 60 s altrimenti;
 2. riceve le azioni dal blocco come link `control-room://…`, accettati solo
    se vengono da un blocco Control Room, e li esegue una volta sola anche con
    più finestre aperte; un *peek* risponde con un secondo evento di vista;
 3. per l'Archivio interroga `history.db` con `cx.db` (sola lettura, fuori dal
    thread della UI) e chiede i lease a `omp session lease`; la ricerca
-   profonda arriva come parole già scelte dal blocco, codificate in base64.
+   profonda arriva come parole già scelte dal blocco, codificate in base64;
+4. al caricamento, all'avvio di un blocco, alla fine di un turno e ogni
+   minuto legge `tern inspect --json`: per ogni pane, da quanto non stampa
+   nulla (`quiet_ms`) e quale sessione omp mostra; di quelle sessioni legge
+   l'ultimo recap e il titolo in `history.db`, e chiede a `omp ps --all --json`
+   i servizi in background che ciascuna possiede (circa 0,2 s, fuori dal
+   thread della UI);
+5. segna sulla **barra dei tab** i tab che contengono pane da guardare
+   (`⚠ 2 · nome del tab`, con `tern.chrome.tab_title`): lo vedi anche con la
+   barra di stato spenta e con Control Room chiuso. Il titolo della finestra
+   (`⚠ N`) e il segmento della barra di stato restano.
 
 Lo stato tenuto dalla finestra è: quando ha visto cambiare un pane (Tern non
 lo riporta), quale agente ha avuto l'ultimo turno fallito, la richiesta
@@ -274,8 +333,12 @@ daemon.
 - Lo snapshot copre le sessioni **di questa finestra** (`cx.session`), come
   le vede Tern. Il client web non esegue Lua: lì il blocco mostra l'ultimo
   stato ricevuto, che invecchia (e lo dice).
-- "Da quanto" conta da quando la finestra ha visto il cambiamento: dopo un
-  reload resta vuoto finché qualcosa cambia.
+- "Da quanto" è il più recente tra il cambiamento visto dalla finestra e
+  l'ultimo output del pane secondo il daemon (`quiet_ms`), che conta al più
+  dall'avvio del daemon: dopo un riavvio di Tern i pane fermi da prima
+  mostrano il tempo dal riavvio.
+- Il recap di un agente vivo è quello che omp ha già scritto (non a ogni
+  turno) e arriva entro un minuto; gli agenti non omp non ne hanno.
 - Il messaggio dell'agente è quello che riporta `cx.agents:list()`
   (`last_message`); la chat del *peek* viene da `cx.agents:transcript`, che
   per gli agenti non omp è vuota. I messaggi di soli tool call compaiono come

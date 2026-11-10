@@ -19,6 +19,7 @@
 
 local common = require("./common")
 local archive = require("./archive")
+local editor = require("./field")
 local ui = tern.ui
 
 type Row = common.Row
@@ -38,15 +39,23 @@ type Entry = {
 }
 
 type Group = { key: string, label: string, order: number, entries: { Entry }, best: Entry }
+--- An action awaiting confirmation, with an optional warning about services.
+type Confirmation = { verb: string, pane: number, title: string, panes: { number }?, note: string? }
 
 type State = {
 	cx: BlockCx,
 	snap: Snapshot?,
 	received: number?,
-	--- `panes`, `agents`, `failures` or `archive`.
+	--- The window hook currently paused for exceeding its budget.
+	pause: common.Pause?,
+	--- The latest provider limits and credential report.
+	usage: common.Usage?,
+	--- `panes`, `agents`, `failures`, `limits` or `archive`.
 	view: string,
 	filter: string,
 	editing: boolean,
+	--- The edited field's caret in UTF-16 units.
+	caret: number,
 	scope: string,
 	group: string,
 	cursor: number?,
@@ -54,8 +63,9 @@ type State = {
 	peek: Peek?,
 	--- The pane a peek was requested for and not yet answered.
 	peeking: number?,
-	--- An action waiting for the user's confirmation in the dock (`interrupt`, `archive`).
-	confirm: { verb: string, pane: number, title: string }?,
+	--- An action waiting for the user's confirmation in the dock (`interrupt`, `archive`,
+	--- `archive_idle`); `panes` when it covers several.
+	confirm: Confirmation?,
 	timer: TimerHandle?,
 	--- The rows in display order, as the last `view` laid them out.
 	order: { Entry },
@@ -83,7 +93,8 @@ type State = {
 	speeking: string?,
 }
 
-local VIEWS = { "panes", "agents", "failures", "archive" }
+local VIEWS = { "panes", "agents", "failures", "limits", "archive" }
+local FEATURES: { "edit" | "undo" } = { "edit" }
 local SCOPES = { "all", "attention", "active" }
 local SCOPE_LABEL: { [string]: string } = { all = "All", attention = "Attention", active = "Active" }
 local GROUPS = { "none", "session", "project" }
@@ -99,7 +110,9 @@ local SEARCH_DELAY_MS = 280
 local ARCHIVE_ROWS = 200
 -- Right-click actions of a pane row; sent lowercased as the action verb.
 local ROW_MENU = { "Go", "Peek", "Ask", "Interrupt", "Pin", "New agent", "Park", "Archive", "Dismiss" }
-local SESSION_MENU = { "Resume", "Peek", "Copy command" }
+local SESSION_MENU = { "Resume", "Restore", "Peek", "Copy command" }
+-- "Archive idle" takes the agents that changed nothing for this long (`bulk_idle_minutes` in kv).
+local BULK_IDLE_MIN = 60
 -- Row-menu labels and button acts, as the verbs the window half knows.
 local ACTION_VERBS: { [string]: string } = {
 	go = "go",
@@ -120,6 +133,11 @@ local CONFIRM: { [string]: { head: string, button: string, text: string } } = {
 		head = "Archive",
 		button = "Archive",
 		text = "Asks it for a short handoff note, then closes it. It stays in the Archive with the note, ready to resume.",
+	},
+	archive_idle = {
+		head = "Archive",
+		button = "Archive all",
+		text = "Asks each for a short handoff note, then closes it. They stay in the Archive with their notes, ready to resume.",
 	},
 }
 
@@ -201,6 +219,51 @@ local function archive_blocked(row: Row): string?
 	return nil
 end
 
+local function bulk_idle_s(): number
+	local ok, value = pcall(tern.kv.get, "bulk_idle_minutes")
+	return 60 * (if ok and type(value) == "number" and value >= 0 then value else BULK_IDLE_MIN)
+end
+
+--- `90m` as `1h 30m`, for the bulk archive's threshold.
+local function minutes(s: number): string
+	local m = s // 60
+	if m < 60 then
+		return m .. "m"
+	end
+	return (m // 60) .. "h" .. (if m % 60 > 0 then " " .. (m % 60) .. "m" else "")
+end
+
+--- The listed agents a bulk action takes: those waiting for a prompt that owe no reply
+--- (`Ask all`), and among them the omp agents idle for the threshold (`Archive idle`).
+local function bulk_targets(state: State): ({ number }, { number })
+	local ask: { number } = {}
+	local idle: { number } = {}
+	local now = os.time()
+	local threshold = bulk_idle_s()
+	for _, e in state.order do
+		local row = e.row
+		local agent = row.agent
+		if agent and agent.state == "idle" and not row.archiving then
+			local update = row.update
+			if not (update and update.reply == nil) then
+				table.insert(ask, row.pane)
+			end
+			if archive_blocked(row) == nil and e.recent > 0 and now - e.recent >= threshold then
+				table.insert(idle, row.pane)
+			end
+		end
+	end
+	return ask, idle
+end
+
+local function join_panes(panes: { number }): string
+	local ids: { string } = {}
+	for _, pane in panes do
+		table.insert(ids, common.id(pane))
+	end
+	return table.concat(ids, "-")
+end
+
 --- Rows from the host's own pane list, used until a window half reports.
 local function fallback_rows(self: number): { Row }
 	local rows: { Row } = {}
@@ -224,16 +287,6 @@ end
 
 local function project_of(row: Row): string
 	return if row.cwd ~= "" then common.basename(row.cwd) else "(unknown directory)"
-end
-
--- The pane's title as Tern reports it; a title that is only a program path
--- (`C:\Windows\…\powershell.exe`, `/bin/zsh`) shows its file name.
-local function label_of(row: Row): string
-	local t = if row.title ~= "" then row.title else (row.program or "pane")
-	if not string.find(t, "%s") and string.find(t, "[/\\]") then
-		t = common.basename(t)
-	end
-	return common.clip(t, 80)
 end
 
 -- A node key from any text: `.` would split the node id, so escape everything else.
@@ -272,6 +325,10 @@ local function matches(row: Row, place: string, status: Status, query: string): 
 		end
 	end
 	add(row.title)
+	add(common.label(row))
+	add(row.path)
+	add(row.url)
+	add(row.session_title)
 	add(row.cwd)
 	add(row.program)
 	add(row.kind)
@@ -448,9 +505,10 @@ local function result_spans(row: Row): { Span }
 	local last = row.last
 	if last then
 		local line = if last.line ~= "" then common.clip(last.line, 36) else "(command)"
+		local exit, tone = common.exit_text(last.status)
 		return {
 			ui.span(line, "mono"),
-			ui.span(if last.status == 0 then "  ok" else "  exit " .. last.status, if last.status == 0 then "success" else "error"),
+			ui.span("  " .. exit, tone),
 			ui.span(" · " .. common.duration(last.took_ms), "muted"),
 		}
 	end
@@ -481,7 +539,7 @@ local function pane_table(state: State, entries: { Entry }, key: string, empty: 
 	for _, e in entries do
 		local row = e.row
 		local level = e.status.level
-		local name: { Span } = { ui.span(label_of(row), if level == "attention" then "strong" else "") }
+		local name: { Span } = { ui.span(common.label(row), if level == "attention" then "strong" else "") }
 		if row.focused then
 			table.insert(name, ui.span("  ●", "accent"))
 		end
@@ -522,13 +580,14 @@ local function failures_table(state: State): Node
 	local rows: { any } = {}
 	if snap then
 		for i, f in snap.failures do
+			local exit, tone = common.exit_text(f.status)
 			table.insert(rows, {
 				id = "f" .. i .. "-" .. row_id(f.pane),
 				menu = { "Go", "Peek" },
 				cells = {
 					line = { ui.span(if f.line ~= "" then common.clip(f.line, 120) else "(line not reported)", "") },
 					pane = { ui.span(common.clip(f.title, 40), "muted") },
-					exit = { ui.span(tostring(f.status), "error") },
+					exit = { ui.span(exit, tone) },
 					took = { ui.span(common.duration(f.took_ms), "muted") },
 					when = { ui.span(common.ago(f.at), "muted") },
 				},
@@ -566,7 +625,7 @@ local function peek_nodes(state: State, pane: number): { Node }
 	if peek == nil or peek.pane ~= pane then
 		return out
 	end
-	local head = "Last lines · " .. common.ago(peek.at) .. " ago"
+	local head = "Last lines · " .. common.since(peek.at)
 	if peek.more and peek.more > 0 then
 		head ..= " · " .. peek.more .. " more above"
 	end
@@ -625,14 +684,16 @@ local function detail_card(state: State, entry: Entry?, rows: number): Node
 	end
 	local last = row.last
 	if last then
+		local exit, tone = common.exit_text(last.status)
 		fact("last command", {
 			ui.span(if last.line ~= "" then common.clip(last.line, 120) else "(line not reported)", "mono"),
-			ui.span(if last.status == 0 then "  ok" else "  exit " .. last.status, if last.status == 0 then "success" else "error"),
-			ui.span(" · " .. common.duration(last.took_ms) .. (if row.finished_at then " · " .. common.ago(row.finished_at) .. " ago" else ""), "muted"),
+			ui.span("  " .. exit, tone),
+			ui.span(" · " .. common.duration(last.took_ms) .. (if row.finished_at then " · " .. common.since(row.finished_at) else ""), "muted"),
 		})
 	end
 	if row.exited ~= nil then
-		fact("exited", { ui.span(tostring(row.exited), if row.exited == 0 then "muted" else "error") })
+		local exit, tone = common.exit_text(row.exited)
+		fact("exited", { ui.span(exit, tone) })
 	end
 	if agent then
 		fact("agent", { ui.span(agent.state, "strong"), ui.span(if agent.model then " · " .. agent.model else "", "muted") })
@@ -640,11 +701,11 @@ local function detail_card(state: State, entry: Entry?, rows: number): Node
 			fact("command", { ui.span(common.clip(agent.command, 120), "mono") })
 		end
 		if agent.failed_at then
-			fact("last turn", { ui.span("failed", "error"), ui.span(" · " .. common.ago(agent.failed_at) .. " ago", "muted") })
+			fact("last turn", { ui.span("failed", "error"), ui.span(" · " .. common.since(agent.failed_at), "muted") })
 		end
 		local update = row.update
 		if update then
-			fact("update asked", common.ago(update.asked_at) .. " ago")
+			fact("update asked", common.since(update.asked_at))
 		end
 	end
 
@@ -669,10 +730,24 @@ local function detail_card(state: State, entry: Entry?, rows: number): Node
 		sm("Archive", "archive", { icon = "archive", keys = { "a" }, disabled = offline or archive_blocked(row) }),
 		sm("Dismiss", "dismiss", { icon = "check", keys = { "x" }, disabled = if has_problem then nil else "Nothing to dismiss on this pane" }),
 	}))
+	local services: { common.Service } = row.services or {}
+	if #services > 0 then
+		table.insert(body, with(ui.rule("Services"), { key = "services-rule" }))
+		for i, service in services do
+			local exit, exit_tone = service.state, "muted"
+			if service.exit ~= nil then
+				exit, exit_tone = common.exit_text(service.exit)
+			end
+			local tone = if service.running then "accent" elseif exit_tone == "error" then "error" else "muted"
+			local description = if service.running then service.state else exit
+			local when = common.since(service.at)
+			table.insert(body, with(ui.text({ ui.span("● ", tone), ui.span(service.name, "strong"), ui.span(" · " .. description .. " · ", tone), ui.span(common.clip(service.command, 120), "mono"), ui.span(if when ~= "" then " · " .. when else "", "muted") }), { key = "service" .. i }))
+		end
+	end
 	local update = if agent then row.update else nil
 	if update then
 		local head = if update.reply
-			then "Reply to the update request · " .. common.ago(update.reply_at) .. " ago"
+			then "Reply to the update request · " .. common.since(update.reply_at)
 			else "Update requested · waiting for the reply"
 		table.insert(body, with(ui.rule(head), { key = "upd-rule" }))
 		if update.reply then
@@ -681,9 +756,14 @@ local function detail_card(state: State, entry: Entry?, rows: number): Node
 	end
 	-- The last message, unless it is the reply shown above.
 	if agent and agent.message and not (update and update.reply == agent.message) then
-		local head = "Last message from the agent" .. (if row.message_at then " · " .. common.ago(row.message_at) .. " ago" else "")
+		local head = "Last message from the agent" .. (if row.message_at then " · " .. common.since(row.message_at) else "")
 		table.insert(body, with(ui.rule(head), { key = "msg-rule" }))
 		table.insert(body, with(ui.md(common.cut(agent.message, MESSAGE_CHARS)), { key = "msg" }))
+	end
+	-- What omp itself last summed the session up as: where it stands, without asking.
+	if agent and row.recap then
+		table.insert(body, with(ui.rule("omp's last recap" .. (if row.recap_at then " · " .. common.since(row.recap_at) else "")), { key = "recap-rule" }))
+		table.insert(body, with(ui.md(row.recap), { key = "recap" }))
 	end
 	for _, n in peek_nodes(state, row.pane) do
 		table.insert(body, n)
@@ -698,7 +778,7 @@ local function detail_card(state: State, entry: Entry?, rows: number): Node
 	if level == "attention" then
 		props.tone = entry.status.tone
 	end
-	return ui.card(label_of(row), children, props)
+	return ui.card(common.label(row), children, props)
 end
 
 local function head_row(state: State, total: number): Node
@@ -706,15 +786,24 @@ local function head_row(state: State, total: number): Node
 	local meta = { tostring(total) .. (if total == 1 then " pane" else " panes") }
 	if snap then
 		table.insert(meta, #snap.sessions .. (if #snap.sessions == 1 then " session" else " sessions"))
-		table.insert(meta, "updated " .. common.ago(state.received) .. " ago")
+		table.insert(meta, "updated " .. common.since(state.received))
+	end
+	local pause = state.pause
+	if pause and pause.ends_at and pause.ends_at <= os.time() then
+		state.pause = nil
+		pause = nil
 	end
 	local link: Node
-	if snap == nil then
-		link = with(ui.badge("No window report", "warning"), { key = "link", title = "Showing only what this host knows (titles, directories, busy). If it stays like this, run Reload plugins from the palette." })
+	local recovery = " Tern resumes a paused hook by itself within 5 minutes; Reload plugins restarts it now."
+	if pause and pause.state == "paused" then
+		local left = if pause.ends_at then " " .. math.max(0, math.ceil(pause.ends_at - os.time())) .. "s" else ""
+		link = with(ui.badge("Paused" .. left, "warning"), { key = "link", title = "A window hook ran over its time budget. Tern resumes it by itself." })
+	elseif snap == nil then
+		link = with(ui.badge("No window report", "warning"), { key = "link", title = "Showing only what this host knows (titles, directories, busy)." .. recovery })
 	elseif os.time() - (state.received or 0) > STALE_S then
-		link = with(ui.badge("Stale " .. common.ago(state.received), "warning"), { key = "link", title = "No report from the window: the list may be out of date. Run Reload plugins from the palette." })
+		link = with(ui.badge("Stale " .. common.ago(state.received), "warning"), { key = "link", title = "No report from the window: the list may be out of date." .. recovery })
 	else
-		link = with(ui.badge("Live", "success"), { key = "link", title = "The window reports every change and at least every 5 seconds" })
+		link = with(ui.badge("Live", "success"), { key = "link", title = "The window reports every change and at least every 15 seconds" })
 	end
 	return ui.node("row", { key = "head", justify = "between", align = "center" }, {
 		ui.node("text", { key = "title", spans = { ui.span("Control Room", "title"), ui.span("   " .. table.concat(meta, " · "), "muted") }, lines = 1 }),
@@ -725,7 +814,105 @@ local function head_row(state: State, total: number): Node
 	})
 end
 
-local function stats_strip(counts: Counts): Node
+--- The limit with the highest known usage, or nil when none reports usage.
+local function worst_limit(report: common.Usage): common.Limit?
+	local worst: common.Limit? = nil
+	for _, limit in report.limits do
+		if limit.used ~= nil and (worst == nil or limit.used > (worst.used or -math.huge)) then
+			worst = limit
+		end
+	end
+	return worst
+end
+
+--- The limits summary tile for the latest report.
+local function limit_tile(report: common.Usage?): StatItem
+	if report == nil then
+		return { label = "Limits", value = "…", sub = "not read yet" }
+	end
+	local worst = worst_limit(report)
+	local used = if worst then worst.used else nil
+	local exhausted = #report.off > 0
+	for _, limit in report.limits do
+		if limit.status == "exhausted" then
+			exhausted = true
+		end
+	end
+	local sub: string
+	if worst == nil and #report.errors > 0 then
+		sub = "could not read: " .. table.concat(report.errors, ", ")
+	elseif #report.off > 0 then
+		sub = #report.off .. (if #report.off == 1 then " credential off" else " credentials off")
+	elseif worst then
+		sub = worst.provider .. " · " .. worst.label .. (if worst.resets_at then " · resets in " .. common.duration(math.max(0, worst.resets_at - os.time()) * 1000) else "")
+	elseif #report.errors > 0 then
+		sub = "could not read: " .. table.concat(report.errors, ", ")
+	else
+		sub = "read " .. common.since(report.at)
+	end
+	return { label = "Limits", value = if used then string.format("%.0f%%", used * 100) else "—", sub = sub, tone = if exhausted then "error" elseif used and used >= 0.8 then "warning" else nil }
+end
+
+local LIMIT_COLS: { Col } = {
+	{ id = "provider", head = "Provider", priority = 9 },
+	{ id = "account", head = "Account", truncate = "middle", priority = 4 },
+	{ id = "window", head = "Window", priority = 7 },
+	{ id = "used", head = "Used", grow = 1, priority = 9 },
+	{ id = "percent", head = "%", align = "end", mono = true, priority = 8 },
+	{ id = "reset", head = "Resets", mono = true, priority = 6 },
+}
+local OFF_COLS: { Col } = {
+	{ id = "provider", head = "Provider", priority = 9 },
+	{ id = "account", head = "Account", truncate = "middle", priority = 4 },
+	{ id = "cause", head = "Cause", grow = 1, priority = 8 },
+	{ id = "since", head = "Since", priority = 6 },
+}
+
+--- The limits and disabled-credentials tables for the current report.
+local function limits_nodes(report: common.Usage?): { Node }
+	if report == nil then
+		return { with(ui.text({ ui.span("Reading the provider limits…", "muted") }), { key = "reading" }) }
+	end
+	local nodes: { Node } = { with(ui.text({ ui.span("Read " .. common.since(report.at), "muted") }), { key = "read" }) }
+	for i, problem in report.errors do
+		table.insert(nodes, with(ui.text({ ui.span(problem, "warning") }), { key = "error" .. i }))
+	end
+	-- Decoded lists are array-tagged and `table.clone` refuses them: copy by hand.
+	local sorted: { common.Limit } = {}
+	for _, limit in report.limits do
+		table.insert(sorted, limit)
+	end
+	table.sort(sorted, function(a: common.Limit, b: common.Limit): boolean
+		return (a.used or -math.huge) > (b.used or -math.huge)
+	end)
+	local rows: { { Cell } | TableRow } = {}
+	for _, limit in sorted do
+		local used = limit.used
+		local meter: Cell = if used ~= nil then ui.meter_cell(math.clamp(used, 0, 1), { 0.8, 1 }) else { ui.span("—", "muted") }
+		local cells: { Cell } = {
+			limit.provider,
+			limit.account or "",
+			limit.label,
+			meter,
+			if used ~= nil then string.format("%.0f%%", used * 100) else "—",
+			if limit.resets_at then "in " .. common.duration(math.max(0, limit.resets_at - os.time()) * 1000) else "",
+		}
+		table.insert(rows, cells)
+	end
+	table.insert(nodes, with(ui.table(LIMIT_COLS, rows, { empty = "No provider limits" }), { key = "limits-table" }))
+	if #report.off > 0 then
+		table.insert(nodes, with(ui.rule("Credentials not in use"), { key = "off-rule" }))
+		local off: { { Cell } | TableRow } = {}
+		for _, credential in report.off do
+			local cells: { Cell } = { credential.provider, credential.account or "", common.clip(credential.cause, 160), common.ago(credential.at) }
+			table.insert(off, cells)
+		end
+		table.insert(nodes, with(ui.table(OFF_COLS, off, nil), { key = "off-table" }))
+	end
+	return nodes
+end
+
+local function stats_strip(state: State, counts: Counts): Node
 	local function n(v: number): string
 		return tostring(v)
 	end
@@ -748,6 +935,7 @@ local function stats_strip(counts: Counts): Node
 		{ label = "Running", value = n(counts.running), sub = if #run_sub > 0 then table.concat(run_sub, " · ") else nil },
 		{ label = "Waiting", value = n(counts.waiting), sub = if counts.waiting > 0 then "agents at a prompt" else nil },
 		{ label = "Idle", value = n(counts.idle) },
+		limit_tile(state.usage),
 	}
 	return ui.node("stats", { key = "stats", items = items })
 end
@@ -762,6 +950,7 @@ local function nav(state: State, total: number, counts: Counts): Node
 		tab("panes", "Panes", total),
 		tab("agents", "Agents", counts.agents),
 		tab("failures", "Failures", fails),
+		tab("limits", "Limits", if state.usage then #state.usage.limits else 0),
 		{ id = "archive", label = { ui.span("Archive "), ui.span(if archived then tostring(archived) else "…", "muted") } },
 	} })
 end
@@ -772,7 +961,7 @@ local function toolbar(state: State): Node
 	local filter = ui.node("input", {
 		key = "filter",
 		text = text,
-		cursor = #text,
+		cursor = state.caret,
 		placeholder = if archive_view then "Search titles, notes, recaps and every prompt you sent" else "Filter panes",
 		icon = "search",
 		keys = { "/" },
@@ -807,18 +996,37 @@ local function toolbar(state: State): Node
 		end
 		return ui.node("tabs", { key = key, variant = "segmented", active = active, items = items })
 	end
-	return ui.node("row", { key = "bar", justify = "between", align = "center", gap = "md" }, {
+	local tools: { Node } = {}
+	if state.view == "agents" then
+		local ask, idle = bulk_targets(state)
+		local offline = if state.snap ~= nil and os.time() - (state.received or 0) <= STALE_S then nil else "Control Room is not getting updates from the window"
+		table.insert(tools, sm("Ask all " .. #ask, "ask_all", {
+			icon = "message",
+			keys = { "U" },
+			title = "Send one message (the status check, to rewrite) to every listed agent waiting for a prompt",
+			disabled = offline or (if #ask > 0 then nil else "No listed agent is waiting for a prompt"),
+		}))
+		table.insert(tools, sm("Archive idle " .. #idle, "archive_idle", {
+			icon = "archive",
+			keys = { "A" },
+			title = "Archive every listed omp agent that has been waiting for over " .. minutes(bulk_idle_s()),
+			disabled = offline or (if #idle > 0 then nil else "No listed omp agent has been waiting for over " .. minutes(bulk_idle_s())),
+		}))
+	end
+	table.insert(tools, seg("scope", state.scope, SCOPES, SCOPE_LABEL))
+	table.insert(tools, seg("group", state.group, GROUPS, GROUP_LABEL))
+	return ui.node("row", { key = "bar", justify = "between", align = "center", gap = "md", wrap = true }, {
 		filter,
-		ui.node("row", { key = "end", gap = "sm", align = "center" }, {
-			seg("scope", state.scope, SCOPES, SCOPE_LABEL),
-			seg("group", state.group, GROUPS, GROUP_LABEL),
-		}),
+		ui.node("row", { key = "end", gap = "sm", align = "center", wrap = true }, tools),
 	})
 end
 
 --- The table (or one per group) of the current pane view.
 local function pane_lists(state: State, groups: { Group }): Node
-	local empty = if state.filter ~= "" then "Nothing matches the filter" elseif state.scope ~= "all" then "Nothing in this scope" else "No other panes"
+	local empty = if state.filter ~= "" then "Nothing matches the filter"
+		elseif state.scope ~= "all" then "Nothing in this scope"
+		elseif state.view == "agents" then "No agents are open"
+		else "No other panes"
 	if state.group == "none" then
 		local entries = if groups[1] then groups[1].entries else {}
 		return pane_table(state, entries, "table", empty)
@@ -1025,7 +1233,7 @@ local function said_nodes(key: string, head: string, list: { common.Said }?, md:
 	end
 	table.insert(out, with(ui.rule(head), { key = key .. "-rule" }))
 	for i, said in list do
-		table.insert(out, with(ui.text({ ui.span(common.ago(said.at) .. " ago", "strong muted") }), { key = key .. "-at" .. i }))
+		table.insert(out, with(ui.text({ ui.span(common.since(said.at), "strong muted") }), { key = key .. "-at" .. i }))
 		table.insert(out, with(if md then ui.md(said.text) else ui.text({ ui.span(said.text) }), { key = key .. i }))
 	end
 	return out
@@ -1046,7 +1254,7 @@ local function session_card(state: State, r: Ranked?, rows: number): Node
 	if s.cwd then
 		fact("directory", { ui.path(s.cwd) })
 	end
-	fact("last activity", common.ago(s.at) .. " ago")
+	fact("last activity", common.since(s.at))
 	fact("prompts", tostring(s.prompts))
 	fact("session", { ui.span(s.id, "mono muted") })
 	local children: { Node } = {}
@@ -1056,6 +1264,12 @@ local function session_card(state: State, r: Ranked?, rows: number): Node
 	local body: { Node } = {}
 	table.insert(body, with(ui.kv(facts), { key = "facts" }))
 	table.insert(body, ui.node("row", { key = "actions", gap = "sm", wrap = true }, {
+		sm("Restore", "restore", {
+			icon = "repeat",
+			keys = { "R" },
+			title = "Resume it and go on with what its last process left unfinished: the interrupted turn and its subagents (omp --restore)",
+			disabled = offline,
+		}),
 		sm("Peek", "speek", { icon = "eye", keys = { "." }, busy = state.speeking == s.id, disabled = offline }),
 		sm("Copy command", "copy", { icon = "copy", keys = { "c" } }),
 	}))
@@ -1064,7 +1278,7 @@ local function session_card(state: State, r: Ranked?, rows: number): Node
 		table.insert(body, with(ui.text(marked(r.snippet, terms, "")), { key = "snip" }))
 	end
 	if s.note then
-		table.insert(body, with(ui.rule("Handoff note · " .. common.ago(s.note_at) .. " ago"), { key = "note-rule" }))
+		table.insert(body, with(ui.rule("Handoff note · " .. common.since(s.note_at)), { key = "note-rule" }))
 		table.insert(body, with(ui.md(s.note), { key = "note" }))
 	end
 	local peek = state.speek
@@ -1080,7 +1294,7 @@ local function session_card(state: State, r: Ranked?, rows: number): Node
 		end
 	else
 		if s.recap then
-			table.insert(body, with(ui.rule("omp's last recap" .. (if s.recap_at then " · " .. common.ago(s.recap_at) .. " ago" else "")), { key = "recap-rule" }))
+			table.insert(body, with(ui.rule("omp's last recap" .. (if s.recap_at then " · " .. common.since(s.recap_at) else "")), { key = "recap-rule" }))
 			table.insert(body, with(ui.md(s.recap), { key = "recap" }))
 		end
 		if s.prompt then
@@ -1112,7 +1326,7 @@ local function view(state: State, cx: BlockCx): BlockView
 		state.peek = nil
 	end
 
-	local parts: { Node } = { head_row(state, total), stats_strip(counts), nav(state, total, counts) }
+	local parts: { Node } = { head_row(state, total), stats_strip(state, counts), nav(state, total, counts) }
 	-- Only the table (and the long part of the card) scroll; the block never
 	-- does. The cap is in sans lines (18px): the pane's height in cells (about
 	-- 16px each) minus what the head, stats, tabs, toolbar, gaps and dock take
@@ -1150,6 +1364,11 @@ local function view(state: State, cx: BlockCx): BlockView
 		page = ui.node("col", { key = "archive" }, {
 			ui.node("row", { key = "body", gap = "lg", align = "start", wrap = true }, { list, session_card(state, selected_session(state), cx.rows) }),
 		})
+	elseif state.view == "limits" then
+		page = ui.node("col", { key = "limits", gap = "md" }, {
+			ui.node("text", { key = "about", spans = { ui.span("Provider limits as omp reports them (omp usage), and the credentials it has stopped using.", "muted") } }),
+			scroller("scroll", limits_nodes(state.usage)),
+		})
 	elseif state.view == "failures" then
 		page = ui.node("col", { key = "failures", gap = "md" }, {
 			ui.node("text", { key = "about", spans = { ui.span("Commands that ended with a nonzero exit, as this window saw them finish; newest first. Right-click a row to go to its pane.", "muted") } }),
@@ -1183,13 +1402,17 @@ local function view(state: State, cx: BlockCx): BlockView
 		local what = CONFIRM[confirm.verb]
 		hint("⏎", "confirm")
 		hint("esc", "cancel")
-		table.insert(dock, ui.node("card", { key = "confirm", tone = if confirm.verb == "archive" then "warning" else "error", icon = "warn", head = what.head .. " " .. confirm.title .. "?", ["end"] = "dock.confirm.end" }, {
+		local children: { Node } = {
 			ui.node("row", { key = "end", gap = "sm" }, {
 				ui.button("Cancel", { key = "cancel", variant = "quiet", size = "sm", keys = { "esc" }, actions = { click = "cancel" } }),
-				ui.button(what.button, { key = "ok", variant = if confirm.verb == "archive" then "primary" else "danger", size = "sm", keys = { "enter" }, actions = { click = "confirm" } }),
+				ui.button(what.button, { key = "ok", variant = if confirm.verb == "interrupt" then "danger" else "primary", size = "sm", keys = { "enter" }, actions = { click = "confirm" } }),
 			}),
 			ui.text({ ui.span(what.text, "muted") }),
-		}))
+		}
+		if confirm.note then
+			table.insert(children, with(ui.text({ ui.span(confirm.note, "warning") }), { key = "note" }))
+		end
+		table.insert(dock, ui.node("card", { key = "confirm", tone = if confirm.verb == "interrupt" then "error" else "warning", icon = "warn", head = what.head .. " " .. confirm.title .. "?", ["end"] = "dock.confirm.end" }, children))
 	elseif state.editing then
 		hint("⏎", if state.view == "archive" then "keep search" else "keep filter")
 		hint("↑↓", "select")
@@ -1197,9 +1420,13 @@ local function view(state: State, cx: BlockCx): BlockView
 	elseif state.view == "archive" then
 		hint("↑↓", "select")
 		hint("⏎", "resume")
+		hint("⇧r", "restore")
 		hint(".", "peek")
 		hint("c", "copy command")
 		hint("/", "search")
+		hint("r", "reload")
+		hint("tab", "view")
+	elseif state.view == "limits" then
 		hint("r", "reload")
 		hint("tab", "view")
 	else
@@ -1212,6 +1439,10 @@ local function view(state: State, cx: BlockCx): BlockView
 		hint("n", "new agent")
 		hint("p", "park")
 		hint("a", "archive")
+		if state.view == "agents" then
+			hint("⇧u", "ask all")
+			hint("⇧a", "archive idle")
+		end
 		hint("x", "dismiss")
 		hint("/", "filter")
 		hint("tab", "view")
@@ -1241,6 +1472,9 @@ local function title(state: State): string?
 end
 
 local function move(state: State, delta: number)
+	if state.view == "limits" then
+		return
+	end
 	if state.view == "archive" then
 		local n = math.min(#state.ranked, ARCHIVE_ROWS)
 		if n == 0 then
@@ -1270,13 +1504,13 @@ end
 
 local function online(state: State): boolean
 	if state.snap == nil or os.time() - (state.received or 0) > STALE_S then
-		state.cx:toast("info", "Control Room is not getting updates from the window", "Run Reload plugins from the palette, then try again.")
+		state.cx:toast("info", "Control Room is not getting updates from the window", "Tern resumes a paused hook by itself within 5 minutes; Reload plugins restarts it now.")
 		return false
 	end
 	return true
 end
 
---- An action on the selected closed session: `resume`, `speek` or `copy`.
+--- An action on the selected closed session: `resume`, `restore`, `speek` or `copy`.
 local function act_session(state: State, verb: string)
 	local r = selected_session(state)
 	if r == nil then
@@ -1298,8 +1532,11 @@ local function act_session(state: State, verb: string)
 end
 
 local function act(state: State, verb: string)
+	if state.view == "limits" then
+		return
+	end
 	if state.view == "archive" then
-		local map: { [string]: string } = { go = "resume", resume = "resume", peek = "speek", speek = "speek", copy = "copy", ["copy command"] = "copy" }
+		local map: { [string]: string } = { go = "resume", resume = "resume", restore = "restore", peek = "speek", speek = "speek", copy = "copy", ["copy command"] = "copy" }
 		if map[verb] then
 			act_session(state, map[verb])
 		end
@@ -1336,19 +1573,30 @@ local function act(state: State, verb: string)
 	end
 	local is_agent = row.agent ~= nil and row.agent.state ~= "exited"
 	if (verb == "ask" or verb == "interrupt") and not is_agent then
-		state.cx:toast("info", "Only a running agent can be " .. (if verb == "ask" then "asked" else "interrupted"), common.clip(row.title, 60))
+		state.cx:toast("info", "Only a running agent can be " .. (if verb == "ask" then "asked" else "interrupted"), common.label(row))
 		return
 	end
 	if verb == "archive" then
 		local why = archive_blocked(row)
 		if why then
-			state.cx:toast("info", "Cannot archive " .. label_of(row) .. " now", why)
+			state.cx:toast("info", "Cannot archive " .. common.label(row) .. " now", why)
 			return
 		end
 	end
 	if CONFIRM[verb] then
 		-- Confirmed from the dock's strip (Enter or its button) before it is sent.
-		state.confirm = { verb = verb :: string, pane = row.pane, title = label_of(row) }
+		local names: { string } = {}
+		local services: { common.Service } = row.services or {}
+		if verb == "archive" then
+			for _, service in services do
+				if service.running then
+					table.insert(names, service.name)
+				end
+			end
+		end
+		local note = if #names > 0 then "It still runs " .. #names .. (if #names == 1 then " service: " else " services: ") .. table.concat(names, ", ") .. "." else nil
+		local confirmation: Confirmation = { verb = verb, pane = row.pane, title = common.label(row), note = note }
+		state.confirm = confirmation
 		return
 	end
 	if verb == "peek" then
@@ -1357,8 +1605,64 @@ local function act(state: State, verb: string)
 	request(state, verb, row.pane)
 end
 
+--- A bulk action on the listed agents: `ask_all` (the window asks for the text) or
+--- `archive_idle` (confirmed in the dock first).
+local function act_bulk(state: State, verb: string)
+	if (state.view ~= "panes" and state.view ~= "agents") or not online(state) then
+		return
+	end
+	local ask, idle = bulk_targets(state)
+	local panes = if verb == "ask_all" then ask else idle
+	if #panes == 0 then
+		state.cx:toast(
+			"info",
+			if verb == "ask_all" then "No listed agent is waiting for a prompt" else "No listed omp agent has been waiting for over " .. minutes(bulk_idle_s()),
+			"Bulk actions take the agents this list shows: check the filter and the scope."
+		)
+		return
+	end
+	if verb == "archive_idle" then
+		local title = #panes .. (if #panes == 1 then " agent" else " agents") .. " idle for over " .. minutes(bulk_idle_s())
+		local count = 0
+		for _, entry in state.order do
+			if table.find(panes, entry.row.pane) then
+				local services: { common.Service } = entry.row.services or {}
+				for _, service in services do
+					if service.running then
+						count += 1
+						break
+					end
+				end
+			end
+		end
+		local note = if count > 0 then count .. (if count == 1 then " agent still runs services." else " agents still run services.") else nil
+		local confirmation: Confirmation = { verb = "archive_idle", pane = panes[1], title = title, panes = panes, note = note }
+		state.confirm = confirmation
+		return
+	end
+	request(state, verb, join_panes(panes))
+end
+
+--- Sends the action waiting in the dock's confirm strip.
+local function confirmed(state: State)
+	local pending = state.confirm
+	state.confirm = nil
+	if pending == nil then
+		return
+	end
+	if pending.panes then
+		request(state, pending.verb, join_panes(pending.panes))
+	else
+		state.cursor = pending.pane
+		request(state, pending.verb, pending.pane)
+	end
+end
+
 local function focus_filter(state: State, on: boolean)
 	state.editing = on
+	if on then
+		state.caret = editor.units(if state.view == "archive" then state.query else state.filter)
+	end
 	local id: any = if on then "main." .. state.view .. ".body.list.bar.filter" else tern.json.null
 	state.cx:frame({ { "focus", id } })
 end
@@ -1374,6 +1678,7 @@ local function set_field(state: State, text: string)
 	else
 		state.filter = text
 	end
+	state.caret = editor.units(text)
 end
 
 --- The session a table row or event item names, from its `s<id>` id.
@@ -1431,19 +1736,24 @@ end
 
 local room: BlockDef<State> = {
 	font = "sans",
+	features = FEATURES,
 	init = function(cx: BlockCx, _args: { string }, saved: any): State
 		local old = running[cx.pane]
 		if old and old.timer then
 			old.timer:cancel()
 		end
 		local prefs = if type(saved) == "table" then saved else {}
+		local ok, saved_usage = pcall(tern.kv.get, "usage")
 		local state: State = {
 			cx = cx,
 			snap = nil,
 			received = nil,
+			pause = nil,
+			usage = if ok then common.usage_of(saved_usage) else nil,
 			view = if table.find(VIEWS, prefs.view) then prefs.view else "panes",
 			filter = if type(prefs.filter) == "string" then prefs.filter else "",
 			editing = false,
+			caret = 0,
 			scope = if SCOPE_LABEL[prefs.scope] then prefs.scope else "all",
 			group = if GROUP_LABEL[prefs.group] then prefs.group else "none",
 			cursor = nil,
@@ -1470,6 +1780,7 @@ local room: BlockDef<State> = {
 			speek = nil,
 			speeking = nil,
 		}
+		state.caret = editor.units(if state.view == "archive" then state.query else state.filter)
 		running[cx.pane] = state
 		start_timer(state)
 		-- Ask the window halves for a snapshot now rather than at their next tick.
@@ -1484,24 +1795,38 @@ local room: BlockDef<State> = {
 		local name = key.name
 		local text = key.text
 		if state.editing then
-			local text_now = field(state)
+			local current: editor.Field = { text = field(state), caret = state.caret }
 			if name == "enter" then
 				focus_filter(state, false)
+				return true
 			elseif name == "escape" then
 				set_field(state, "")
 				focus_filter(state, false)
-			elseif name == "backspace" then
-				local n = utf8.len(text_now) or 0
-				set_field(state, if n > 0 then string.sub(text_now, 1, (utf8.offset(text_now, n) or 1) - 1) else "")
+				return true
 			elseif name == "up" or name == "down" then
 				move(state, if name == "up" then -1 else 1)
+				return true
+			elseif name == "backspace" then
+				current = editor.backspace(current)
+			elseif name == "delete" then
+				current = editor.delete(current)
+			elseif name == "left" then
+				current = editor.left(current)
+			elseif name == "right" then
+				current = editor.right(current)
+			elseif name == "home" then
+				current = editor.home(current)
+			elseif name == "end" then
+				current = editor.finish(current)
 			elseif name == "paste" and text then
-				set_field(state, text_now .. (string.gsub(text, "%s+", " ")))
+				current = editor.insert(current, (string.gsub(text, "%s+", " ")))
 			elseif text and text ~= "" and not key.ctrl and not key.meta then
-				set_field(state, text_now .. text)
+				current = editor.insert(current, text)
 			else
 				return false
 			end
+			set_field(state, current.text)
+			state.caret = current.caret
 			return true
 		end
 		if key.ctrl or key.meta or key.alt then
@@ -1510,9 +1835,7 @@ local room: BlockDef<State> = {
 		local pending = state.confirm
 		if pending then
 			if name == "enter" then
-				state.confirm = nil
-				state.cursor = pending.pane
-				request(state, pending.verb, pending.pane)
+				confirmed(state)
 			elseif name == "escape" then
 				state.confirm = nil
 			else
@@ -1521,7 +1844,17 @@ local room: BlockDef<State> = {
 			return true
 		end
 		local press = text or name
-		if name == "up" or press == "k" then
+		-- Shifted letters: the bulk actions and the Archive's restore.
+		local shifted = if text and #text == 1 and (key.shift or string.match(text, "%u")) then string.lower(text) else nil
+		if shifted == "u" then
+			act_bulk(state, "ask_all")
+		elseif shifted == "a" then
+			if state.view ~= "archive" then
+				act_bulk(state, "archive_idle")
+			end
+		elseif shifted == "r" and state.view == "archive" then
+			act(state, "restore")
+		elseif name == "up" or press == "k" then
 			move(state, -1)
 		elseif name == "down" or press == "j" then
 			move(state, 1)
@@ -1553,12 +1886,14 @@ local room: BlockDef<State> = {
 			act(state, "archive")
 		elseif press == "c" and state.view == "archive" then
 			act(state, "copy")
-		elseif press == "/" then
+		elseif press == "/" and state.view ~= "limits" and state.view ~= "failures" then
 			focus_filter(state, true)
 		elseif name == "tab" or press == "]" then
 			state.view = cycle(VIEWS, state.view, if key.shift then -1 else 1)
+			state.caret = editor.units(field(state))
 		elseif press == "[" then
 			state.view = cycle(VIEWS, state.view, -1)
+			state.caret = editor.units(field(state))
 		elseif press == "v" then
 			state.scope = cycle(SCOPES, state.scope)
 		elseif press == "g" then
@@ -1566,6 +1901,8 @@ local room: BlockDef<State> = {
 		elseif press == "r" then
 			if state.view == "archive" then
 				ask_catalog(state)
+			elseif state.view == "limits" then
+				request(state, "usage", nil)
 			else
 				request(state, "refresh", nil)
 			end
@@ -1580,10 +1917,23 @@ local room: BlockDef<State> = {
 		if archive_event(state, ev) then
 			return
 		end
+		if ev.ev == "action" and (ev.act == "usage" or ev.act == "budget") and type(ev.value) == "string" then
+			local ok, value = pcall(tern.json.decode, ev.value)
+			if ok and ev.act == "usage" then
+				local report = common.usage_of(value)
+				if report then
+					state.usage = report
+				end
+			elseif ok and type(value) == "table" and type(value.hook) == "string" and (value.state == "paused" or value.state == "resumed") and (value.ends_at == nil or type(value.ends_at) == "number") then
+				state.pause = if value.state == "paused" then value :: common.Pause else nil
+			end
+			return
+		end
 		if ev.ev == "action" and ev.act == "snapshot" then
 			local ok, snap = pcall(tern.json.decode, ev.value)
 			if ok and type(snap) == "table" and type(snap.rows) == "table" then
 				state.snap = snap :: Snapshot
+				state.pause = nil
 				state.received = os.time()
 			end
 			return
@@ -1598,13 +1948,23 @@ local room: BlockDef<State> = {
 			end
 			return
 		end
-		if ev.ev == "focus" then
+		local id = tostring(ev.id or "")
+		if ev.ev == "edit" and state.editing and string.find(id, "%.bar%.filter$") and type(ev.from) == "number" and type(ev.to) == "number" and type(ev.text) == "string" and type(ev.cursor) == "number" and type(ev.len) == "number" then
+			local updated = editor.edit({ text = field(state), caret = state.caret }, ev.from, ev.to, ev.text, ev.cursor, ev.len)
+			if updated then
+				set_field(state, updated.text)
+				state.caret = updated.caret
+			end
+			return
+		end
+		if ev.ev == "focus" and string.find(id, "%.bar%.filter$") then
 			focus_filter(state, true)
 			return
 		end
-		local id = tostring(ev.id or "")
 		if ev.ev == "select" and string.find(id, "%.nav$") and table.find(VIEWS, ev.item) then
 			state.view = ev.item
+			focus_filter(state, false)
+			state.caret = editor.units(field(state))
 			return
 		end
 		if ev.ev == "select" and string.find(id, "%.scope$") and SCOPE_LABEL[ev.item] then
@@ -1640,6 +2000,8 @@ local room: BlockDef<State> = {
 		if ev.ev == "action" and ev.act == "refresh" then
 			if state.view == "archive" then
 				ask_catalog(state)
+			elseif state.view == "limits" then
+				request(state, "usage", nil)
 			else
 				request(state, "refresh", nil)
 			end
@@ -1648,18 +2010,19 @@ local room: BlockDef<State> = {
 		if ev.ev == "action" then
 			local verb = string.lower(tostring(ev.act))
 			if verb == "confirm" or verb == "cancel" then
-				if verb == "confirm" and state.confirm then
-					local pending = state.confirm
-					state.confirm = nil
-					state.cursor = pending.pane
-					request(state, pending.verb, pending.pane)
+				if verb == "confirm" then
+					confirmed(state)
 				else
 					state.confirm = nil
 				end
 				return
 			end
+			if verb == "ask_all" or verb == "archive_idle" then
+				act_bulk(state, verb)
+				return
+			end
 			local sid = session_of(ev.item)
-			if sid or verb == "resume" or verb == "speek" or verb == "copy" or verb == "copy command" then
+			if sid or verb == "resume" or verb == "restore" or verb == "speek" or verb == "copy" or verb == "copy command" then
 				if sid then
 					state.scursor = sid
 				end

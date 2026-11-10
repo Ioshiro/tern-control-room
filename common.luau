@@ -5,10 +5,11 @@
 --
 -- Data flows one way each:
 --   window -> block: `cx.session:event(block, {ev = "action", act = <what>, value = json})`
---                    (`snapshot`, `peek`, `catalog`, `hits`, `speek`)
+--                    (`snapshot`, `peek`, `catalog`, `hits`, `speek`, `usage`, `budget`)
 --   block -> window: `cx:open("control-room://<verb>[/<target>[/<nonce>]]")`, claimed by
---                    the window half's `tern.route.link`; the target is a pane id, an omp
---                    session id or a URL-safe base64 search query.
+--                    the window half's `tern.route.link`; the target is a pane id, pane ids
+--                    joined by `-` (bulk actions), an omp session id or a URL-safe base64
+--                    search query.
 
 local common = {}
 
@@ -65,10 +66,92 @@ export type Row = {
 	update: Update?,
 	--- When Control Room asked the agent for a handoff note before closing it (`archive`).
 	archiving: number?,
+	--- omp's latest recap of the session the pane shows (`history.db`), and when it wrote it.
+	recap: string?,
+	recap_at: number?,
+	--- A file or git block's path, a browser block's address (`PaneInfo.path`, `.url`).
+	path: string?,
+	url: string?,
+	--- omp's title of the session the pane shows (`history.db`), for a pane whose own
+	--- title says nothing (a program path).
+	session_title: string?,
+	--- The background services omp supervises for that session (`omp ps`): the running
+	--- ones and those that ended lately.
+	services: { Service }?,
 }
 
 --- `reply` is the agent's own text, as its transcript (or last message) holds it.
 export type Update = { asked_at: number, reply: string?, reply_at: number? }
+
+--- A background service of an omp session, as `omp ps --json` lists it. `running` is false
+--- once it exited or failed; `exit` is its exit code then, when omp has one; `at` is when it
+--- ended, else when it became ready or started (seconds).
+export type Service = { name: string, state: string, running: boolean, command: string, exit: number?, at: number? }
+
+--- One of this plugin's window hooks paused for running over its budget, or resumed
+--- (`tern.on("budget")`): `ends_at` is when the pause ends (seconds), nil once resumed.
+export type Pause = { hook: string, state: string, ends_at: number? }
+
+--- One limit window of a provider account. `source` is where it was read: `omp`
+--- (`omp usage`) or `proxy` (CLIProxyAPI). `used` is the used fraction (0 to 1, above 1 for
+--- overage), nil when the source gives none; `resets_at` is in seconds; `status` is `ok`,
+--- `warning`, `exhausted` or `unknown`.
+export type Limit = {
+	source: string,
+	provider: string,
+	account: string?,
+	label: string,
+	used: number?,
+	resets_at: number?,
+	status: string,
+}
+
+--- A credential a source will not use, and why.
+export type Credential = { source: string, provider: string, account: string?, cause: string, at: number? }
+
+--- Provider limits, read on request (`control-room://usage`); `errors` says which source
+--- could not be read.
+export type Usage = { at: number, limits: { Limit }, off: { Credential }, errors: { string } }
+
+local function optional(v: any, kind: string): boolean
+	return v == nil or type(v) == kind
+end
+
+--- `value` as a limits report when it has the shape of one (it comes from `tern.kv` or from
+--- the other half as JSON), else nil.
+function common.usage_of(value: any): Usage?
+	if type(value) ~= "table" or type(value.at) ~= "number" then
+		return nil
+	end
+	if type(value.limits) ~= "table" or type(value.off) ~= "table" or type(value.errors) ~= "table" then
+		return nil
+	end
+	for _, l in value.limits do
+		if type(l) ~= "table" or type(l.source) ~= "string" or type(l.provider) ~= "string" then
+			return nil
+		end
+		if type(l.label) ~= "string" or type(l.status) ~= "string" then
+			return nil
+		end
+		if not (optional(l.account, "string") and optional(l.used, "number") and optional(l.resets_at, "number")) then
+			return nil
+		end
+	end
+	for _, c in value.off do
+		if type(c) ~= "table" or type(c.source) ~= "string" or type(c.provider) ~= "string" or type(c.cause) ~= "string" then
+			return nil
+		end
+		if not (optional(c.account, "string") and optional(c.at, "number")) then
+			return nil
+		end
+	end
+	for _, e in value.errors do
+		if type(e) ~= "string" then
+			return nil
+		end
+	end
+	return value :: Usage
+end
 
 --- A failed command, as a `command_finished` event reported it.
 export type Failure = { pane: number, title: string, line: string, status: number, took_ms: number, at: number }
@@ -219,10 +302,72 @@ function common.basename(path: string): string
 	return string.match(trimmed, "([^/\\]+)$") or trimmed
 end
 
+local PROGRAM_EXT: { [string]: boolean } = { exe = true, cmd = true, bat = true, com = true }
+
+--- A pane's title, trimmed, with a title that is only a path (`/bin/zsh`, a directory,
+--- `C:\Windows\system32\cmd.exe`) cut to its last component; the program when the title is
+--- empty. The second value is true when the title said nothing of its own (empty or a path).
+function common.short_title(title: string, program: string?): (string, boolean)
+	local t = string.match(title, "^%s*(.-)%s*$") or title
+	if t == "" then
+		local p = program or ""
+		return (if p ~= "" then common.basename(p) else ""), true
+	end
+	local ext = string.match(string.lower(t), "^%a:[/\\].*%.(%a+)$")
+	local path = (not string.find(t, "%s") and string.find(t, "[/\\]") ~= nil) or (ext ~= nil and PROGRAM_EXT[ext] == true)
+	if path then
+		return common.basename(t), true
+	end
+	return t, false
+end
+
+--- What a row is called, at most 80 characters: its title; for a title that says nothing,
+--- omp's title of its session; for a file, git or browser block, its file, repository or
+--- address.
+function common.label(row: Row): string
+	local t, generic = common.short_title(row.title, row.program)
+	if generic then
+		if row.kind == "file" and row.path then
+			t = common.basename(row.path)
+		elseif row.kind == "git" then
+			local root = row.path or row.cwd
+			t = if root ~= "" then "Git · " .. common.basename(root) else "Git"
+		elseif row.kind == "browser" and row.url then
+			t = row.url
+		elseif row.session_title then
+			t = row.session_title
+		end
+	end
+	if t == "" then
+		t = if row.kind ~= "" then row.kind else "pane"
+	end
+	return common.clip(t, 80)
+end
+
+-- Ctrl-C: 130 from a POSIX shell (128 + SIGINT), STATUS_CONTROL_C_EXIT from Windows
+-- (0xC000013A, signed or not).
+local INTERRUPTED: { [number]: boolean } = { [130] = true, [-1073741510] = true, [3221225786] = true }
+
+--- Whether an exit status says the user interrupted the program (Ctrl-C): not a failure.
+function common.interrupted(status: number): boolean
+	return INTERRUPTED[status] == true
+end
+
+--- How an exit status reads, and its tone: `ok`, `interrupted` or `exit N`.
+function common.exit_text(status: number): (string, string)
+	if status == 0 then
+		return "ok", "success"
+	elseif common.interrupted(status) then
+		return "interrupted", "muted"
+	end
+	return "exit " .. string.format("%.0f", status), "error"
+end
+
 --- Identifies the problem a row shows (a failed last command, a nonzero exit), so an
---- acknowledgement covers that one run only; nil when there is none.
+--- acknowledgement covers that one run only; nil when there is none. A command or program
+--- the user interrupted (Ctrl-C) is none.
 function common.problem(row: Row): string?
-	if row.exited ~= nil and row.exited ~= 0 then
+	if row.exited ~= nil and row.exited ~= 0 and not common.interrupted(row.exited) then
 		return "exit|" .. row.exited
 	end
 	local agent = row.agent
@@ -230,7 +375,7 @@ function common.problem(row: Row): string?
 		return "turn|" .. agent.failed_at
 	end
 	local last = row.last
-	if last == nil or last.status == 0 or row.running ~= nil or agent ~= nil then
+	if last == nil or last.status == 0 or common.interrupted(last.status) or row.running ~= nil or agent ~= nil then
 		return nil
 	end
 	return string.format("cmd|%s|%d|%d", last.line, last.status, last.took_ms)
@@ -299,18 +444,21 @@ function common.acks(): { [string]: string }
 	return if ok and type(value) == "table" then value else {}
 end
 
---- `1.2s`, `3m 05s`, `1h 02m`.
+--- `1.2s`, `3m 05s`, `1h 02m`, `6d 02h`.
 function common.duration(ms: number): string
 	local s = ms / 1000
 	if s < 60 then
 		return string.format("%.1fs", s)
 	elseif s < 3600 then
 		return string.format("%dm %02ds", s // 60, s % 60)
+	elseif s < 86400 then
+		return string.format("%dh %02dm", s // 3600, (s % 3600) // 60)
 	end
-	return string.format("%dh %02dm", s // 3600, (s % 3600) // 60)
+	return string.format("%dd %02dh", s // 86400, (s % 86400) // 3600)
 end
 
---- How long ago `t` (seconds, `os.time()`) was: `now`, `12s`, `5m`, `3h`, `2d`.
+--- How long ago `t` (seconds, `os.time()`) was, for a column headed Age: `now`, `12s`, `5m`,
+--- `3h`, `2d`. In a sentence use `since`.
 function common.ago(t: number?): string
 	if t == nil then
 		return ""
@@ -326,6 +474,12 @@ function common.ago(t: number?): string
 		return s // 3600 .. "h"
 	end
 	return s // 86400 .. "d"
+end
+
+--- How long ago `t` was, as a phrase: `just now`, `12s ago`, `5m ago`; empty for nil.
+function common.since(t: number?): string
+	local a = common.ago(t)
+	return if a == "" then "" elseif a == "now" then "just now" else a .. " ago"
 end
 
 return common

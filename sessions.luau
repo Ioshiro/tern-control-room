@@ -134,7 +134,7 @@ local function list_files(): number
 	return count
 end
 
-local function omp_exe(): string
+function sessions.omp_exe(): string
 	-- Tern ships omp beside itself on Windows; elsewhere (or without it) PATH decides.
 	local local_app = tern.getenv("LOCALAPPDATA")
 	if local_app then
@@ -150,7 +150,7 @@ end
 --- The ids among `ids` some running omp holds, asked `LEASE_BATCH` at a time; nil when that could not be checked.
 local function leases(ids: { string }, done: (held: { [string]: boolean }?, err: string?, cx: WindowCx?) -> ())
 	local held: { [string]: boolean } = {}
-	local exe = omp_exe()
+	local exe = sessions.omp_exe()
 	local function batch(from: number, latest: WindowCx?)
 		if from > #ids then
 			done(held, nil, latest)
@@ -180,30 +180,119 @@ local function leases(ids: { string }, done: (held: { [string]: boolean }?, err:
 	batch(1, nil)
 end
 
---- Sessions an omp pane of Tern shows, from `tern inspect` (it names each pane's omp session
---- file): a resumed omp may not hold the lease until its first turn. Empty when it fails.
-local function open_in_tern(done: (shown: { [string]: boolean }) -> ())
+--- What the daemon says of one pane (`tern inspect`): the omp session it shows and how long
+--- it has printed nothing (counted from the daemon's start at most).
+export type Inspected = { sid: string?, quiet_ms: number? }
+
+--- Every pane of the daemon by pane id, from `tern inspect --json`; nil when it fails.
+function sessions.inspect(done: (panes: { [string]: Inspected }?) -> ())
 	local exe = tern.getenv("TERN_EXE")
 	local argv = { if exe and exe ~= "" then exe else "tern", "inspect", "--json" }
 	local ok = pcall(function()
 		tern.process.run(argv, { timeout_ms = LEASE_TIMEOUT_MS }, function(result: ProcessResult, _cx: WindowCx?)
-			local shown: { [string]: boolean } = {}
 			local parsed, value = pcall(tern.json.decode, result.stdout)
-			if result.status == 0 and parsed and type(value) == "table" and type(value.panes) == "table" then
-				for _, p in value.panes do
-					local file = if type(p) == "table" then p.omp_session_file else nil
-					local id = if type(file) == "string" then string.match(file, "_([%w%-]+)%.jsonl$") else nil
-					if id then
-						shown[id] = true
-					end
+			if result.status ~= 0 or not parsed or type(value) ~= "table" or type(value.panes) ~= "table" then
+				done(nil)
+				return
+			end
+			local panes: { [string]: Inspected } = {}
+			for _, p in value.panes do
+				if type(p) == "table" and type(p.pane) == "number" then
+					local file = p.omp_session_file
+					panes[common.id(p.pane)] = {
+						sid = if type(file) == "string" then string.match(file, "_([%w%-]+)%.jsonl$") else nil,
+						quiet_ms = num(p.quiet_ms),
+					}
 				end
 			end
-			done(shown)
+			done(panes)
 		end)
 	end)
 	if not ok then
-		done({})
+		done(nil)
 	end
+end
+
+--- Maps omp's service groups to their owning sessions, retaining recent exits.
+function sessions.services_of(value: any, now: number): { [string]: { common.Service } }?
+	if type(value) ~= "table" then
+		return nil
+	end
+	local out: { [string]: { common.Service } } = {}
+	for key, group in value do
+		if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or type(group) ~= "table" or type(group.daemons) ~= "table" then
+			return nil
+		end
+		for index, daemon in group.daemons do
+			if type(index) ~= "number" or index < 1 or index % 1 ~= 0 then
+				return nil
+			end
+			if type(daemon) == "table" and type(daemon.owner) == "string" and type(daemon.name) == "string" then
+				local state = if type(daemon.state) == "string" then daemon.state else "unknown"
+				local running = state ~= "exited" and state ~= "failed"
+				local ms = num(daemon.exitedAt) or num(daemon.readyAt) or num(daemon.startedAt)
+				local at = if ms then math.floor(ms / 1000) else nil
+				if running or (at ~= nil and at >= now - 12 * 60 * 60) then
+					local service: common.Service = {
+						name = daemon.name,
+						state = state,
+						running = running,
+						command = common.clip(if type(daemon.command) == "string" then daemon.command else "", 160),
+						exit = if running then nil else num(daemon.exitCode),
+						at = at,
+					}
+					local owner: string = daemon.owner
+					local list = out[owner]
+					if list == nil then
+						list = {}
+						out[owner] = list
+					end
+					table.insert(list, service)
+				end
+			end
+		end
+	end
+	for _, list in out do
+		table.sort(list, function(a: common.Service, b: common.Service): boolean
+			return (a.at or 0) > (b.at or 0)
+		end)
+		while #list > 8 do
+			table.remove(list)
+		end
+	end
+	return out
+end
+
+--- Reads the services supervised by omp without blocking the window.
+function sessions.services(done: (by_session: { [string]: { common.Service } }?) -> ())
+	local ok = pcall(function()
+		tern.process.run({ sessions.omp_exe(), "ps", "--all", "--json", "--plain" }, { timeout_ms = 20000 }, function(result: ProcessResult, _cx: WindowCx?)
+			if result.status ~= 0 then
+				done(nil)
+				return
+			end
+			local parsed, value = pcall(tern.json.decode, result.stdout)
+			done(if parsed then sessions.services_of(value, os.time()) else nil)
+		end)
+	end)
+	if not ok then
+		done(nil)
+	end
+end
+
+--- Sessions an omp pane of Tern shows (`tern inspect` names each pane's omp session file): a
+--- resumed omp may not hold the lease until its first turn. Empty when it fails.
+local function open_in_tern(done: (shown: { [string]: boolean }) -> ())
+	sessions.inspect(function(panes: { [string]: Inspected }?)
+		local shown: { [string]: boolean } = {}
+		local list: { [string]: Inspected } = panes or {}
+		for _, p in list do
+			if p.sid then
+				shown[p.sid] = true
+			end
+		end
+		done(shown)
+	end)
 end
 
 --- Handoff notes by session id. Notes are kept under their nonce until the prompt
@@ -491,8 +580,65 @@ function sessions.peek(cx: WindowCx, id: string, send: Send)
 	end)
 end
 
---- Opens a tab resuming the session in its own directory: `omp --resume <file>`.
-function sessions.resume(cx: WindowCx, id: string): (boolean, string?)
+--- omp's latest recap of each of the sessions `ids` name, by session id.
+function sessions.recaps(cx: WindowCx, ids: { string }, done: (recaps: { [string]: common.Said }, cx: WindowCx?) -> ())
+	local list: { string } = {}
+	for _, id in ids do
+		if sessions.valid_id(id) then
+			table.insert(list, quote(id))
+		end
+	end
+	if #list == 0 then
+		done({}, cx)
+		return
+	end
+	local sql = "SELECT session_id, substr(recap, 1, 700), created_at FROM session_recaps WHERE id IN "
+		.. "(SELECT max(id) FROM session_recaps WHERE session_id IN ("
+		.. table.concat(list, ",")
+		.. ") GROUP BY session_id)"
+	query(cx, sql, #list, function(rows: { { DbCell } }?, _err: string?, later: WindowCx?)
+		local out: { [string]: common.Said } = {}
+		local result: { { DbCell } } = rows or {}
+		for _, row in result do
+			local sid, text = str(row[1]), str(row[2])
+			if sid and text then
+				out[sid] = { text = text, at = num(row[3]) or 0 }
+			end
+		end
+		done(out, later)
+	end)
+end
+
+--- omp's title of each of the sessions `ids` name, by session id.
+function sessions.titles(cx: WindowCx, ids: { string }, done: (titles: { [string]: string }, cx: WindowCx?) -> ())
+	local list: { string } = {}
+	for _, id in ids do
+		if sessions.valid_id(id) then
+			table.insert(list, quote(id))
+		end
+	end
+	if #list == 0 then
+		done({}, cx)
+		return
+	end
+	local sql = "SELECT session_id, substr(title, 1, 160) FROM session_titles WHERE session_id IN (" .. table.concat(list, ",") .. ")"
+	query(cx, sql, #list, function(rows: { { DbCell } }?, _err: string?, later: WindowCx?)
+		local out: { [string]: string } = {}
+		local result: { { DbCell } } = rows or {}
+		for _, row in result do
+			local sid, title = str(row[1]), str(row[2])
+			if sid and title then
+				out[sid] = title
+			end
+		end
+		done(out, later)
+	end)
+end
+
+--- Opens a tab resuming the session in its own directory: `omp --resume <file>`, or with
+--- `restore` `omp --restore <file>`, which also goes on with the turn (and the subagents)
+--- its last process left unfinished.
+function sessions.resume(cx: WindowCx, id: string, restore: boolean?): (boolean, string?)
 	if not sessions.valid_id(id) then
 		return false, "Not a session id"
 	end
@@ -514,7 +660,7 @@ function sessions.resume(cx: WindowCx, id: string): (boolean, string?)
 		end
 	end
 	local ok, err = pcall(function()
-		cx.layout:new_tab({ cwd = cwd, command = "omp --resume " .. quoted })
+		cx.layout:new_tab({ cwd = cwd, command = (if restore then "omp --restore " else "omp --resume ") .. quoted })
 	end)
 	if not ok then
 		return false, tostring(err)
