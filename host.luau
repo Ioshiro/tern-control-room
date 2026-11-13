@@ -20,6 +20,8 @@
 local common = require("./common")
 local archive = require("./archive")
 local editor = require("./field")
+local boards = require("./boards")
+local boards_view = require("./boards_view")
 local ui = tern.ui
 
 type Row = common.Row
@@ -50,10 +52,23 @@ type State = {
 	pause: common.Pause?,
 	--- The latest provider limits and credential report.
 	usage: common.Usage?,
+	board_report: boards.Report?,
+	board_asked: number?,
+	board_done: boolean,
+	board_collapsed: { [string]: boolean },
+	board_filter: string,
+	board_mode: string,
+	board_selected: string?,
+	board_menu: boolean,
+	board_menu_cursor: number,
+	board_anchor: string?,
+	board_entries: { boards_view.Entry },
 	--- `panes`, `agents`, `failures`, `limits` or `archive`.
 	view: string,
 	filter: string,
 	editing: boolean,
+	--- The dock lists every key, not just each view's main ones (`?`).
+	all_keys: boolean,
 	--- The edited field's caret in UTF-16 units.
 	caret: number,
 	scope: string,
@@ -93,7 +108,7 @@ type State = {
 	speeking: string?,
 }
 
-local VIEWS = { "panes", "agents", "failures", "limits", "archive" }
+local VIEWS = { "panes", "agents", "boards", "failures", "limits", "archive" }
 local FEATURES: { "edit" | "undo" } = { "edit" }
 local SCOPES = { "all", "attention", "active" }
 local SCOPE_LABEL: { [string]: string } = { all = "All", attention = "Attention", active = "Active" }
@@ -397,7 +412,7 @@ local function layout(state: State): ({ Group }, Counts, number)
 		end
 	end
 	local acks = common.acks()
-	local counts: Counts = { attention = 0, running = 0, waiting = 0, idle = 0, agents = 0, agents_waiting = 0, agents_working = 0, commands = 0, failed = 0 }
+	local counts: Counts = { attention = 0, running = 0, waiting = 0, idle = 0, agents = 0, agents_waiting = 0, agents_working = 0, commands = 0, failed = 0, unseen = 0 }
 	local total = 0
 	local groups: { [string]: Group } = {}
 	local list: { Group } = {}
@@ -417,8 +432,12 @@ local function layout(state: State): ({ Group }, Counts, number)
 		elseif row.running then
 			counts.commands += 1
 		end
-		if status.level == "attention" and status.tone == "error" then
-			counts.failed += 1
+		if status.level == "attention" then
+			if status.tone == "error" then
+				counts.failed += 1
+			elseif not (agent and agent.state == "waiting_input") then
+				counts.unseen += 1
+			end
 		end
 		if (not only_agents or agent ~= nil) and in_scope(state.scope, status) and matches(row, where(row, snap), status, state.filter) then
 			local key, label, order = "all", "", 0
@@ -525,16 +544,17 @@ local function pane_of(item: any): number?
 	return if id then tonumber(id) else nil
 end
 
+-- Status is an icon and a word (the full sentence is the tooltip and the card's).
+-- Where a pane lives is not a column: grouping by session or project says it, and
+-- the card's head and the filter keep it.
 local PANE_COLS: { Col } = {
 	{ id = "name", head = "Pane", grow = 1, priority = 9 },
-	{ id = "where", head = "Where", priority = 4, truncate = "middle" },
-	{ id = "status", head = "Status", priority = 7 },
-	{ id = "last", head = "Last", priority = 6 },
+	{ id = "status", head = "Status", priority = 8 },
+	{ id = "last", head = "Last", grow = 1, priority = 6 },
 	{ id = "age", head = "Age", align = "end", mono = true, priority = 5 },
 }
 
 local function pane_table(state: State, entries: { Entry }, key: string, empty: string): Node
-	local snap = state.snap
 	local rows: { any } = {}
 	for _, e in entries do
 		local row = e.row
@@ -549,9 +569,8 @@ local function pane_table(state: State, entries: { Entry }, key: string, empty: 
 			menu = ROW_MENU,
 			title = if row.cwd ~= "" then row.cwd else nil,
 			cells = {
-				name = { text = name, dot = status_tone },
-				where = { ui.span(where(row, snap), "muted") },
-				status = { ui.span(e.status.text, status_tone) },
+				name = { text = name },
+				status = { text = { ui.span(e.status.word, status_tone) }, icon = e.status.icon, tone = status_tone, title = e.status.text },
 				last = result_spans(row),
 				age = { ui.span(if e.recent > 0 then common.ago(e.recent) else "", "muted") },
 			},
@@ -559,6 +578,7 @@ local function pane_table(state: State, entries: { Entry }, key: string, empty: 
 	end
 	return ui.node("table", {
 		key = key,
+		role = "control-room.panes",
 		cols = PANE_COLS,
 		rows = rows,
 		selectable = true,
@@ -581,13 +601,15 @@ local function failures_table(state: State): Node
 	if snap then
 		for i, f in snap.failures do
 			local exit, tone = common.exit_text(f.status)
+			local slip = common.slip(f.line, f.status, f.took_ms)
 			table.insert(rows, {
 				id = "f" .. i .. "-" .. row_id(f.pane),
 				menu = { "Go", "Peek" },
+				title = if slip then "Probably a typing slip: it failed at once" else nil,
 				cells = {
-					line = { ui.span(if f.line ~= "" then common.clip(f.line, 120) else "(line not reported)", "") },
+					line = { ui.span(if f.line ~= "" then common.clip(f.line, 120) else "(line not reported)", if slip then "muted" else "") },
 					pane = { ui.span(common.clip(f.title, 40), "muted") },
-					exit = { ui.span(exit, tone) },
+					exit = { ui.span(exit, if slip then "muted" else tone) },
 					took = { ui.span(common.duration(f.took_ms), "muted") },
 					when = { ui.span(common.ago(f.at), "muted") },
 				},
@@ -600,7 +622,6 @@ local function failures_table(state: State): Node
 		rows = rows,
 		selectable = true,
 		empty = { ui.span("No command has failed since this window loaded the plugin", "muted") },
-		max = { w = "120ch" },
 	})
 end
 
@@ -654,7 +675,7 @@ local function sm(text: string, act: string, props: { [string]: any }): Node
 end
 
 local function detail_card(state: State, entry: Entry?, rows: number): Node
-	local props: { [string]: any } = { key = "detail", role = "control-room.card", min = { w = "44ch" }, max = { w = "60ch" } }
+	local props: { [string]: any } = { key = "detail", role = "control-room.card", min = { w = "38ch" }, max = { w = "48ch" } }
 	if entry == nil then
 		return ui.card("No pane selected", { ui.text({ ui.span("Select a row to see what it is doing", "muted") }) }, props)
 	end
@@ -832,82 +853,91 @@ local function limit_tile(report: common.Usage?): StatItem
 	end
 	local worst = worst_limit(report)
 	local used = if worst then worst.used else nil
-	local exhausted = #report.off > 0
+	-- The tile's tone is the worst window's use; credentials omp stopped using
+	-- are a separate problem, told in the subtitle, not by painting the number.
+	local exhausted = false
 	for _, limit in report.limits do
 		if limit.status == "exhausted" then
 			exhausted = true
 		end
 	end
-	local sub: string
+	local sub: Spans
 	if worst == nil and #report.errors > 0 then
-		sub = "could not read: " .. table.concat(report.errors, ", ")
+		sub = { ui.span("could not read: " .. table.concat(report.errors, ", "), "warning") }
 	elseif #report.off > 0 then
-		sub = #report.off .. (if #report.off == 1 then " credential off" else " credentials off")
+		sub = { ui.span(#report.off .. (if #report.off == 1 then " credential off" else " credentials off"), "warning") }
 	elseif worst then
 		sub = worst.provider .. " · " .. worst.label .. (if worst.resets_at then " · resets in " .. common.duration(math.max(0, worst.resets_at - os.time()) * 1000) else "")
 	elseif #report.errors > 0 then
-		sub = "could not read: " .. table.concat(report.errors, ", ")
+		sub = { ui.span("could not read: " .. table.concat(report.errors, ", "), "warning") }
 	else
 		sub = "read " .. common.since(report.at)
 	end
-	return { label = "Limits", value = if used then string.format("%.0f%%", used * 100) else "—", sub = sub, tone = if exhausted then "error" elseif used and used >= 0.8 then "warning" else nil }
+	return { label = "Limits", value = if used then string.format("%.0f%%", used * 100) else "—", sub = sub, tone = if exhausted or (used and used >= 1) then "error" elseif used and used >= 0.8 then "warning" else nil }
 end
 
 local LIMIT_COLS: { Col } = {
-	{ id = "provider", head = "Provider", priority = 9 },
-	{ id = "account", head = "Account", truncate = "middle", priority = 4 },
-	{ id = "window", head = "Window", priority = 7 },
+	{ id = "window", head = "Window", priority = 9 },
 	{ id = "used", head = "Used", grow = 1, priority = 9 },
 	{ id = "percent", head = "%", align = "end", mono = true, priority = 8 },
-	{ id = "reset", head = "Resets", mono = true, priority = 6 },
+	{ id = "reset", head = "Resets", align = "end", mono = true, priority = 6 },
 }
 local OFF_COLS: { Col } = {
 	{ id = "provider", head = "Provider", priority = 9 },
 	{ id = "account", head = "Account", truncate = "middle", priority = 4 },
 	{ id = "cause", head = "Cause", grow = 1, priority = 8 },
-	{ id = "since", head = "Since", priority = 6 },
+	{ id = "since", head = "Since", align = "end", mono = true, priority = 6 },
 }
 
---- The limits and disabled-credentials tables for the current report.
+--- The limits, one section per provider account, and the credentials omp stopped using.
 local function limits_nodes(report: common.Usage?): { Node }
 	if report == nil then
-		return { with(ui.text({ ui.span("Reading the provider limits…", "muted") }), { key = "reading" }) }
+		return { ui.node("skeleton", { key = "reading", shape = "rows", rows = 4 }) }
 	end
-	local nodes: { Node } = { with(ui.text({ ui.span("Read " .. common.since(report.at), "muted") }), { key = "read" }) }
+	local nodes: { Node } = {}
 	for i, problem in report.errors do
 		table.insert(nodes, with(ui.text({ ui.span(problem, "warning") }), { key = "error" .. i }))
 	end
-	-- Decoded lists are array-tagged and `table.clone` refuses them: copy by hand.
-	local sorted: { common.Limit } = {}
-	for _, limit in report.limits do
-		table.insert(sorted, limit)
-	end
-	table.sort(sorted, function(a: common.Limit, b: common.Limit): boolean
-		return (a.used or -math.huge) > (b.used or -math.huge)
-	end)
-	local rows: { { Cell } | TableRow } = {}
-	for _, limit in sorted do
-		local used = limit.used
-		local meter: Cell = if used ~= nil then ui.meter_cell(math.clamp(used, 0, 1), { 0.8, 1 }) else { ui.span("—", "muted") }
-		local cells: { Cell } = {
-			limit.provider,
-			limit.account or "",
-			limit.label,
-			meter,
-			if used ~= nil then string.format("%.0f%%", used * 100) else "—",
-			if limit.resets_at then "in " .. common.duration(math.max(0, limit.resets_at - os.time()) * 1000) else "",
-		}
-		table.insert(rows, cells)
-	end
-	table.insert(nodes, with(ui.table(LIMIT_COLS, rows, { empty = "No provider limits" }), { key = "limits-table" }))
-	if #report.off > 0 then
-		table.insert(nodes, with(ui.rule("Credentials not in use"), { key = "off-rule" }))
-		local off: { { Cell } | TableRow } = {}
-		for _, credential in report.off do
-			local cells: { Cell } = { credential.provider, credential.account or "", common.clip(credential.cause, 160), common.ago(credential.at) }
-			table.insert(off, cells)
+	local groups = common.group_limits(report.limits)
+	for gi, g in groups do
+		local rows: { TableRow } = {}
+		for li, limit in g.limits do
+			local used = limit.used
+			table.insert(rows, {
+				id = "l" .. li,
+				cells = {
+					limit.label,
+					if used ~= nil then ui.meter_cell(math.clamp(used, 0, 1), { 0.8, 1 }) else { ui.span("—", "muted") },
+					{ ui.span(if used ~= nil then string.format("%.0f%%", used * 100) else "—", if used and used >= 1 then "error" elseif used and used >= 0.8 then "warning" elseif used and used > 0 then "" else "muted") },
+					{ ui.span(if limit.resets_at then "in " .. common.duration(math.max(0, limit.resets_at - os.time()) * 1000) else "", "muted") },
+				},
+			})
 		end
-		table.insert(nodes, with(ui.table(OFF_COLS, off, nil), { key = "off-table" }))
+		local head: { Span } = { ui.span(g.provider, "strong") }
+		if g.account then table.insert(head, ui.span("  " .. g.account, "muted")) end
+		local tbl = with(ui.table(LIMIT_COLS, rows, nil), { key = "t", role = "control-room.limits" })
+		table.insert(nodes, with(ui.section(head, { tbl }), { key = "g" .. gi, collapsible = true }))
+	end
+	if #groups == 0 then
+		table.insert(nodes, ui.node("empty", { key = "none", variant = "inline", icon = "gauge", text = "omp reported no provider limits" }))
+	end
+	if #report.off > 0 then
+		local off: { TableRow } = {}
+		for i, credential in report.off do
+			table.insert(off, {
+				id = "c" .. i,
+				title = credential.cause,
+				cells = {
+					credential.provider,
+					{ ui.span(credential.account or "", "muted") },
+					{ ui.span(common.short_cause(credential.cause), "warning") },
+					{ ui.span(common.ago(credential.at), "muted") },
+				},
+			})
+		end
+		table.insert(nodes, with(ui.section({ ui.span("Credentials not in use", "strong"), ui.span("  " .. #report.off, "muted") }, {
+			with(ui.table(OFF_COLS, off, nil), { key = "t" }),
+		}), { key = "off", collapsible = true }))
 	end
 	return nodes
 end
@@ -922,6 +952,9 @@ local function stats_strip(state: State, counts: Counts): Node
 	end
 	if counts.failed > 0 then
 		table.insert(att_sub, counts.failed .. " failed")
+	end
+	if counts.unseen > 0 then
+		table.insert(att_sub, counts.unseen .. " not seen yet")
 	end
 	local run_sub = {}
 	if counts.agents_working > 0 then
@@ -940,18 +973,20 @@ local function stats_strip(state: State, counts: Counts): Node
 	return ui.node("stats", { key = "stats", items = items })
 end
 
+--- View tabs. A count shows only once its data has been read: no `0` or `…` standing in.
 local function nav(state: State, total: number, counts: Counts): Node
-	local fails = if state.snap then #state.snap.failures else 0
-	local function tab(id: string, label: string, count: number): { [string]: any }
-		return { id = id, label = { ui.span(label .. " "), ui.span(tostring(count), "muted") } }
+	local snap = state.snap
+	local function tab(id: string, label: string, count: number?, tone: string?): { [string]: any }
+		return { id = id, label = if count then { ui.span(label .. " "), ui.span(tostring(count), tone or "muted") } else { ui.span(label) } }
 	end
-	local archived = if state.catalog then #state.catalog.sessions else nil
+	local fails = if snap then #snap.failures else nil
 	return ui.node("tabs", { key = "nav", active = state.view, items = {
-		tab("panes", "Panes", total),
-		tab("agents", "Agents", counts.agents),
-		tab("failures", "Failures", fails),
-		tab("limits", "Limits", if state.usage then #state.usage.limits else 0),
-		{ id = "archive", label = { ui.span("Archive "), ui.span(if archived then tostring(archived) else "…", "muted") } },
+		tab("panes", "Panes", if snap then total else nil),
+		tab("agents", "Agents", if snap then counts.agents else nil),
+		tab("boards", "Boards", if state.board_report then #state.board_report.boards else nil),
+		tab("failures", "Failures", if fails and fails > 0 then fails else nil),
+		tab("limits", "Limits", if state.usage and #state.usage.off > 0 then #state.usage.off else nil, "warning"),
+		tab("archive", "Archive", if state.catalog then #state.catalog.sessions else nil),
 	} })
 end
 
@@ -1364,9 +1399,40 @@ local function view(state: State, cx: BlockCx): BlockView
 		page = ui.node("col", { key = "archive" }, {
 			ui.node("row", { key = "body", gap = "lg", align = "start", wrap = true }, { list, session_card(state, selected_session(state), cx.rows) }),
 		})
+	elseif state.view == "boards" then
+		if not state.board_menu and (state.board_asked == nil or os.time() - state.board_asked >= 15) then
+			state.board_asked = os.time()
+			request(state, "boards", cx.pane)
+		end
+		local fresh = state.board_report ~= nil and os.time() - state.board_report.at <= 45 and state.board_report.error == nil and state.snap ~= nil and os.time() - (state.received or 0) <= STALE_S
+		if not fresh then state.board_menu = false end
+		local nodes, entries = boards_view.render(state.board_report, {
+			room = cx.pane,
+			show_done = state.board_done,
+			collapsed = state.board_collapsed,
+			query = state.board_filter,
+			mode = if state.board_mode == "list" then "list" else "board",
+			selected = state.board_selected,
+			enabled = fresh,
+		})
+		state.board_entries = entries
+		local found = false
+		for _, entry in entries do if entry.token == state.board_selected then found = true; break end end
+		if not found then state.board_selected = nil; state.board_menu = false end
+		local open, done = boards_view.totals(state.board_report)
+		local updated = if state.board_report then "updated " .. common.since(state.board_report.at) else "reading…"
+		page = ui.node("col", { key = "boards", gap = "md" }, {
+			ui.node("row", { key = "bar", gap = "sm", align = "center", wrap = true }, {
+				ui.node("input", { key = "filter", text = state.board_filter, cursor = state.caret, placeholder = "Filter", icon = "search", clear = true, max = { w = "32ch" }, grow = 1 }),
+				ui.node("text", { key = "count", grow = 1, spans = { ui.span(open .. " open · " .. done .. " done", "mono muted"), ui.span("  " .. updated, "muted") } }),
+				ui.button("", { key = "done", size = "sm", variant = "quiet", icon = if state.board_done then "eye" else "eye-off", on = not state.board_done, title = if state.board_done then "Hide done cards" else "Show done cards", actions = { click = "board_done" } }),
+				ui.node("tabs", { key = "mode", variant = "segmented", active = state.board_mode, items = { { id = "board", label = "Board" }, { id = "list", label = "List" } } }),
+			}),
+			scroller("scroll", nodes),
+		})
 	elseif state.view == "limits" then
 		page = ui.node("col", { key = "limits", gap = "md" }, {
-			ui.node("text", { key = "about", spans = { ui.span("Provider limits as omp reports them (omp usage), and the credentials it has stopped using.", "muted") } }),
+			ui.node("text", { key = "about", spans = { ui.span("Provider limits as omp reports them (omp usage), and the credentials it has stopped using", "muted"), ui.span(if state.usage then " · read " .. common.since(state.usage.at) else "", "muted") } }),
 			scroller("scroll", limits_nodes(state.usage)),
 		})
 	elseif state.view == "failures" then
@@ -1391,8 +1457,14 @@ local function view(state: State, cx: BlockCx): BlockView
 	end
 	table.insert(parts, page)
 
+	-- The dock shows each view's main keys; `?` adds the rest.
 	local keys: { Span } = {}
-	local function hint(k: string, label: string)
+	local hidden = false
+	local function hint(k: string, label: string, more: boolean?)
+		if more and not state.all_keys then
+			hidden = true
+			return
+		end
 		table.insert(keys, ui.span(k, "key"))
 		table.insert(keys, ui.span(" " .. label .. "  ", "muted"))
 	end
@@ -1420,12 +1492,24 @@ local function view(state: State, cx: BlockCx): BlockView
 	elseif state.view == "archive" then
 		hint("↑↓", "select")
 		hint("⏎", "resume")
-		hint("⇧r", "restore")
 		hint(".", "peek")
-		hint("c", "copy command")
 		hint("/", "search")
-		hint("r", "reload")
-		hint("tab", "view")
+		hint("⇧r", "restore", true)
+		hint("c", "copy command", true)
+		hint("r", "reload", true)
+		hint("tab", "view", true)
+	elseif state.view == "boards" then
+		hint("↑↓", "select")
+		hint("←→", "move")
+		hint("space", "done")
+		hint("⏎", "open")
+		hint("/", "filter")
+		hint("m", "menu", true)
+		hint("e", "edit", true)
+		hint("d", if state.board_done then "hide done" else "show done", true)
+		hint("v", if state.board_mode == "board" then "list" else "board", true)
+		hint("r", "reload", true)
+		hint("tab", "view", true)
 	elseif state.view == "limits" then
 		hint("r", "reload")
 		hint("tab", "view")
@@ -1434,25 +1518,40 @@ local function view(state: State, cx: BlockCx): BlockView
 		hint("⏎", "go")
 		hint(".", "peek")
 		hint("u", "ask")
-		hint("i", "interrupt")
 		hint("f", "pin")
-		hint("n", "new agent")
-		hint("p", "park")
-		hint("a", "archive")
-		if state.view == "agents" then
-			hint("⇧u", "ask all")
-			hint("⇧a", "archive idle")
-		end
-		hint("x", "dismiss")
 		hint("/", "filter")
-		hint("tab", "view")
-		hint("v", "scope")
-		hint("g", "group")
+		hint("i", "interrupt", true)
+		hint("n", "new agent", true)
+		hint("p", "park", true)
+		hint("a", "archive", true)
+		if state.view == "agents" then
+			hint("⇧u", "ask all", true)
+			hint("⇧a", "archive idle", true)
+		end
+		hint("x", "dismiss", true)
+		hint("tab", "view", true)
+		hint("v", "scope", true)
+		hint("g", "group", true)
+	end
+	if hidden or state.all_keys then
+		hint("?", if state.all_keys then "fewer keys" else "all keys")
 	end
 	table.insert(dock, ui.node("text", { key = "keys", spans = keys, lines = 1 }))
+	local layer: Node? = nil
+	if state.view == "boards" and state.board_menu then
+		for _, entry in state.board_entries do
+			if entry.token == state.board_selected then
+				local anchored = table.clone(entry)
+				anchored.anchor = state.board_anchor or entry.anchor
+				layer = ui.col({ ui.el("div", { key = "board_backdrop", role = "control-room.board-backdrop", actions = { click = "board_dismiss" } }), boards_view.overlay(anchored, state.board_menu_cursor) })
+				break
+			end
+		end
+	end
 	return {
 		main = with(ui.node("col", { gap = "lg" }, parts), { role = "control-room.main" }),
 		dock = ui.col(dock),
+		layer = layer,
 	}
 end
 
@@ -1472,7 +1571,7 @@ local function title(state: State): string?
 end
 
 local function move(state: State, delta: number)
-	if state.view == "limits" then
+	if state.view == "limits" or state.view == "boards" then
 		return
 	end
 	if state.view == "archive" then
@@ -1510,6 +1609,31 @@ local function online(state: State): boolean
 	return true
 end
 
+local BOARD_VERBS = { board_open = true, board_pin = true, board_check = true, board_move = true, board_add = true, board_edit = true }
+
+--- Sends a board action (`board_<verb>:<payload>`) to the window half, only while the report is fresh:
+--- card ids come from that read and go stale when the file is reloaded.
+local function board_run(state: State, act: string?): boolean
+	if act == nil then return false end
+	local verb, target = string.match(act, "^(board_%a+):([%w_%-]+)$")
+	if not verb or not target or not BOARD_VERBS[verb] then return false end
+	local report = state.board_report
+	if report == nil or os.time() - report.at > 45 or report.error then
+		state.cx:toast("info", "Boards are being read again", "Try again in a moment.")
+		return false
+	end
+	if not online(state) then return false end
+	request(state, verb, target)
+	return true
+end
+
+local function board_entry(state: State): boards_view.Entry?
+	for _, entry in state.board_entries do
+		if entry.token == state.board_selected then return entry end
+	end
+	return nil
+end
+
 --- An action on the selected closed session: `resume`, `restore`, `speek` or `copy`.
 local function act_session(state: State, verb: string)
 	local r = selected_session(state)
@@ -1532,7 +1656,7 @@ local function act_session(state: State, verb: string)
 end
 
 local function act(state: State, verb: string)
-	if state.view == "limits" then
+	if state.view == "limits" or state.view == "boards" then
 		return
 	end
 	if state.view == "archive" then
@@ -1661,20 +1785,23 @@ end
 local function focus_filter(state: State, on: boolean)
 	state.editing = on
 	if on then
-		state.caret = editor.units(if state.view == "archive" then state.query else state.filter)
+		state.caret = editor.units(if state.view == "archive" then state.query else if state.view == "boards" then state.board_filter else state.filter)
 	end
-	local id: any = if on then "main." .. state.view .. ".body.list.bar.filter" else tern.json.null
+	local id: any = if on then (if state.view == "boards" then "main.boards.bar.filter" else "main." .. state.view .. ".body.list.bar.filter") else tern.json.null
 	state.cx:frame({ { "focus", id } })
 end
 
 --- The text the search field edits: the Archive's query or the panes filter.
 local function field(state: State): string
-	return if state.view == "archive" then state.query else state.filter
+	return if state.view == "archive" then state.query else if state.view == "boards" then state.board_filter else state.filter
 end
 
 local function set_field(state: State, text: string)
 	if state.view == "archive" then
 		state.query = text
+	elseif state.view == "boards" then
+		state.board_filter = text
+		state.board_menu = false
 	else
 		state.filter = text
 	end
@@ -1750,9 +1877,21 @@ local room: BlockDef<State> = {
 			received = nil,
 			pause = nil,
 			usage = if ok then common.usage_of(saved_usage) else nil,
+			board_report = nil,
+			board_asked = nil,
+			board_done = prefs.board_done == true,
+			board_collapsed = if type(prefs.board_collapsed) == "table" then prefs.board_collapsed else {},
+			board_filter = if type(prefs.board_filter) == "string" then prefs.board_filter else "",
+			board_mode = if prefs.board_mode == "list" then "list" else "board",
+			board_selected = nil,
+			board_menu = false,
+			board_menu_cursor = 1,
+			board_anchor = nil,
+			board_entries = {},
 			view = if table.find(VIEWS, prefs.view) then prefs.view else "panes",
 			filter = if type(prefs.filter) == "string" then prefs.filter else "",
 			editing = false,
+			all_keys = prefs.all_keys == true,
 			caret = 0,
 			scope = if SCOPE_LABEL[prefs.scope] then prefs.scope else "all",
 			group = if GROUP_LABEL[prefs.group] then prefs.group else "none",
@@ -1843,6 +1982,66 @@ local room: BlockDef<State> = {
 			end
 			return true
 		end
+		if text == "?" then
+			state.all_keys = not state.all_keys
+			return true
+		end
+		if state.view == "boards" then
+			local press = text or name
+			if state.board_menu then
+				if name == "escape" then state.board_menu = false; return true end
+				local entry = board_entry(state)
+				if entry then
+					local count = #entry.destinations
+					if count > 0 and (name == "up" or name == "down") then
+						state.board_menu_cursor = ((state.board_menu_cursor - 1 + (if name == "up" then -1 else 1)) % count) + 1
+						return true
+					elseif name == "enter" then
+						local dest = entry.destinations[state.board_menu_cursor]
+						if dest then board_run(state, dest.action) end
+						state.board_menu = false; return true
+					end
+				end
+				return false
+			end
+			local entry = board_entry(state)
+			if name == "tab" or press == "]" then
+				state.view = cycle(VIEWS, state.view, if key.shift then -1 else 1)
+			elseif press == "[" then
+				state.view = cycle(VIEWS, state.view, -1)
+			elseif name == "up" or name == "down" then
+				local n = #state.board_entries
+				if n > 0 then
+					local at = 0
+					for i, item in state.board_entries do if item.token == state.board_selected then at = i; break end end
+					at = if at == 0 then (if name == "up" then n else 1) else math.clamp(at + (if name == "up" then -1 else 1), 1, n)
+					state.board_selected = state.board_entries[at].token
+					state.board_anchor = nil
+				end
+			elseif press == "/" then
+				focus_filter(state, true)
+			elseif press == "m" then
+				if entry and state.board_report and os.time() - state.board_report.at <= 45 and not state.board_report.error and online(state) then state.board_menu = true; state.board_menu_cursor = 1; state.board_anchor = nil end
+			elseif (name == "left" or name == "right") and entry then
+				board_run(state, if name == "left" then entry.left else entry.right)
+			elseif (press == " " or name == "space") and entry then
+				board_run(state, entry.check)
+			elseif press == "e" and entry then
+				board_run(state, entry.edit)
+			elseif name == "enter" and entry then
+				board_run(state, entry.open)
+			elseif press == "v" then
+				state.board_mode = if state.board_mode == "board" then "list" else "board"
+			elseif press == "d" then
+				state.board_done = not state.board_done
+			elseif press == "r" then
+				state.board_asked = os.time()
+				request(state, "boards", state.cx.pane)
+			else
+				return false
+			end
+			return true
+		end
 		local press = text or name
 		-- Shifted letters: the bulk actions and the Archive's restore.
 		local shifted = if text and #text == 1 and (key.shift or string.match(text, "%u")) then string.lower(text) else nil
@@ -1917,6 +2116,16 @@ local room: BlockDef<State> = {
 		if archive_event(state, ev) then
 			return
 		end
+		if ev.ev == "action" and ev.act == "boards" and type(ev.value) == "string" then
+			local ok, value = pcall(tern.json.decode, ev.value)
+			if ok then
+				local report = boards.report_of(value)
+				if report then
+					state.board_report = report
+				end
+			end
+			return
+		end
 		if ev.ev == "action" and (ev.act == "usage" or ev.act == "budget") and type(ev.value) == "string" then
 			local ok, value = pcall(tern.json.decode, ev.value)
 			if ok and ev.act == "usage" then
@@ -1961,11 +2170,57 @@ local room: BlockDef<State> = {
 			focus_filter(state, true)
 			return
 		end
+		if ev.ev == "select" and state.view == "boards" and string.find(id, "%.bar%.mode$") and (ev.item == "board" or ev.item == "list") then
+			state.board_mode = ev.item
+			state.board_menu = false
+			return
+		end
 		if ev.ev == "select" and string.find(id, "%.nav$") and table.find(VIEWS, ev.item) then
 			state.view = ev.item
 			focus_filter(state, false)
 			state.caret = editor.units(field(state))
 			return
+		end
+		if state.view == "boards" and ev.ev == "action" then
+			local verb = tostring(ev.act or "")
+			if verb == "board_done" then
+				state.board_menu = false
+				state.board_done = not state.board_done
+				return
+			elseif verb == "board_dismiss" then
+				state.board_menu = false
+				return
+			elseif verb == "board_menu" then
+				if state.board_report and os.time() - state.board_report.at <= 45 and not state.board_report.error and online(state) then state.board_menu = not state.board_menu; state.board_menu_cursor = 1; state.board_anchor = id end
+				return
+			elseif verb == "refresh" then
+				state.board_asked = os.time()
+				request(state, "boards", state.cx.pane)
+				return
+			end
+			local selection = string.match(verb, "^board_select:([%w_%-]+)$")
+			if selection then
+				state.board_selected = selection
+				state.board_menu = false
+				state.board_anchor = nil
+				return
+			end
+			local session = string.match(verb, "^board_session:(%d+)$")
+			if session then
+				state.board_collapsed[session] = not state.board_collapsed[session]
+				state.board_menu = false
+				return
+			end
+			local pane = string.match(verb, "^board_agent:(%d+)$")
+			if pane then
+				if online(state) then request(state, "pin", tonumber(pane)) end
+				return
+			end
+			if BOARD_VERBS[string.match(verb, "^(board_%a+):") or ""] then
+				board_run(state, verb)
+				state.board_menu = false
+				return
+			end
 		end
 		if ev.ev == "select" and string.find(id, "%.scope$") and SCOPE_LABEL[ev.item] then
 			state.scope = ev.item
@@ -2045,7 +2300,7 @@ local room: BlockDef<State> = {
 		end
 	end,
 	save = function(state: State): any
-		return { view = state.view, filter = state.filter, scope = state.scope, group = state.group, query = state.query }
+		return { view = state.view, filter = state.filter, scope = state.scope, group = state.group, query = state.query, all_keys = state.all_keys, board_done = state.board_done, board_filter = state.board_filter, board_mode = state.board_mode, board_collapsed = state.board_collapsed }
 	end,
 }
 

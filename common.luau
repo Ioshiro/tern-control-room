@@ -213,7 +213,9 @@ export type Said = { text: string, at: number }
 --- A closed session's last prompts and recaps, read on request (`control-room://speek/<id>`).
 export type SessionPeek = { id: string, at: number, prompts: { Said }?, recaps: { Said }?, error: string? }
 --- Where a row stands: `attention`, `running`, `waiting` or `idle` (the order rows sort in).
-export type Status = { level: string, rank: number, tone: string, text: string }
+--- `icon` and `word` are the compact form a table cell shows; `text` is the full sentence
+--- (detail card, tooltip, filter).
+export type Status = { level: string, rank: number, tone: string, icon: string, word: string, text: string }
 
 local RANK: { [string]: number } = { attention = 1, running = 2, waiting = 3, idle = 4 }
 
@@ -353,6 +355,12 @@ function common.interrupted(status: number): boolean
 	return INTERRUPTED[status] == true
 end
 
+--- A command that failed at once on a typing slip (`cd ..ù`, `cde ..`): a short single
+--- line, exit 1 or 127, under half a second. Shown dimmed, never hidden: it is a guess.
+function common.slip(line: string, status: number, took_ms: number): boolean
+	return (status == 1 or status == 127) and took_ms < 500 and #line <= 24 and not string.find(line, "[|;&]")
+end
+
 --- How an exit status reads, and its tone: `ok`, `interrupted` or `exit N`.
 function common.exit_text(status: number): (string, string)
 	if status == 0 then
@@ -381,8 +389,8 @@ function common.problem(row: Row): string?
 	return string.format("cmd|%s|%d|%d", last.line, last.status, last.took_ms)
 end
 
-local function status(level: string, tone: string, text: string): Status
-	return { level = level, rank = RANK[level], tone = tone, text = text }
+local function status(level: string, tone: string, icon: string, word: string, text: string): Status
+	return { level = level, rank = RANK[level], tone = tone, icon = icon, word = word, text = text }
 end
 
 --- Where a row stands, from Tern's facts alone. `acks` maps pane ids to the
@@ -391,51 +399,51 @@ function common.classify(row: Row, acks: { [string]: string }): Status
 	local problem = common.problem(row)
 	local acked = problem ~= nil and acks[common.id(row.pane)] == problem
 	if row.error then
-		return status("attention", "error", "failed to start: " .. common.clip(row.error, 80))
+		return status("attention", "error", "x-circle", "failed", "failed to start: " .. common.clip(row.error, 80))
 	end
 	local agent = row.agent
 	if agent then
 		if row.archiving then
-			return status("running", "accent", "archiving: writing its handoff note")
+			return status("running", "accent", "inbox", "archiving", "archiving: writing its handoff note")
 		end
 		if agent.delivery_error then
-			return status("attention", "error", "prompt not delivered: " .. common.clip(agent.delivery_error, 80))
+			return status("attention", "error", "x-circle", "not sent", "prompt not delivered: " .. common.clip(agent.delivery_error, 80))
 		elseif agent.state == "waiting_input" then
-			return status("attention", "warning", "needs your input")
+			return status("attention", "warning", "help", "asks you", "needs your input")
 		elseif agent.state == "working" then
-			return status("running", "accent", "working")
+			return status("running", "accent", "activity", "working", "working")
 		elseif agent.state == "exited" or row.exited ~= nil then
 			if problem and not acked then
-				return status("attention", "error", "exited " .. (row.exited or 0))
+				return status("attention", "error", "x-circle", "exit " .. (row.exited or 0), "exited " .. (row.exited or 0))
 			end
-			return status("idle", "muted", "exited")
+			return status("idle", "muted", "power", "exited", "exited")
 		elseif agent.failed_at and not acked then
-			return status("attention", "error", "turn failed")
+			return status("attention", "error", "x-circle", "failed", "turn failed")
 		elseif row.alert then
-			return status("attention", "warning", "turn finished, not seen yet")
+			return status("attention", "warning", "bell", "done", "turn finished, not seen yet")
 		end
-		return status("waiting", "pending", "waiting for a prompt")
+		return status("waiting", "pending", "prompt", "ready", "waiting for a prompt")
 	end
 	if row.exited ~= nil then
 		if problem and not acked then
-			return status("attention", "error", "exited " .. row.exited)
+			return status("attention", "error", "x-circle", "exit " .. row.exited, "exited " .. row.exited)
 		end
-		return status("idle", "muted", "exited")
+		return status("idle", "muted", "power", "exited", "exited")
 	end
 	local running = row.running
 	if running then
-		return status("running", "accent", "running " .. common.clip(running.line, 60))
+		return status("running", "accent", "play", "running", "running " .. common.clip(running.line, 60))
 	end
 	if row.busy then
-		return status("running", "accent", "busy")
+		return status("running", "accent", "activity", "busy", "busy")
 	end
 	if problem and not acked then
-		return status("attention", "error", "failed, exit " .. (row.last :: Last).status)
+		return status("attention", "error", "x-circle", "exit " .. (row.last :: Last).status, "failed, exit " .. (row.last :: Last).status)
 	end
 	if row.alert then
-		return status("attention", "warning", "alert, not seen yet")
+		return status("attention", "warning", "bell", "alert", "alert, not seen yet")
 	end
-	return status("idle", "muted", "idle")
+	return status("idle", "muted", "terminal", "idle", "idle")
 end
 
 --- Acknowledged problems by pane id, kept in `tern.kv` under `acks`.
@@ -480,6 +488,56 @@ end
 function common.since(t: number?): string
 	local a = common.ago(t)
 	return if a == "" then "" elseif a == "now" then "just now" else a .. " ago"
+end
+
+--- A credential's cause in a few words: the readable part of a provider error, the
+--- raw text kept for the tooltip. `oauth refresh failed: … 401 {"error":"invalid_client",
+--- "error_description":"…"}` gives `invalid_client` (401) when no description reads better.
+function common.short_cause(cause: string): string
+	local described = string.match(cause, '"error_description"%s*:%s*"([^"]+)"')
+		or string.match(cause, '"message"%s*:%s*"([^"]+)"')
+	local code = string.match(cause, '"error"%s*:%s*"([^"]+)"')
+	local http = string.match(cause, "%f[%d](%d%d%d)%f[%D]%s*{")
+	local head = string.match(cause, "^([^:{]+)")
+	local text = described or code or head or cause
+	text = string.gsub(text, "^%s+", "")
+	text = string.gsub(text, "%s+$", "")
+	if http and not string.find(text, http, 1, true) then text ..= " (" .. http .. ")" end
+	return common.clip(text, 80)
+end
+
+--- Limits of one provider account, with identical windows (same label, use and reset
+--- minute) told once; groups ordered by their most used window, windows likewise.
+export type LimitGroup = { provider: string, account: string?, worst: number, limits: { Limit } }
+function common.group_limits(limits: { Limit }): { LimitGroup }
+	local groups: { LimitGroup } = {}
+	local by: { [string]: LimitGroup } = {}
+	local seen: { [string]: boolean } = {}
+	for _, limit in limits do
+		local k = limit.provider .. "\0" .. (limit.account or "")
+		local g = by[k]
+		if g == nil then
+			g = { provider = limit.provider, account = limit.account, worst = -1, limits = {} }
+			by[k] = g
+			table.insert(groups, g)
+		end
+		local same = k .. "\0" .. limit.label .. "\0" .. tostring(limit.used) .. "\0" .. tostring(if limit.resets_at then limit.resets_at // 60 else nil)
+		if not seen[same] then
+			seen[same] = true
+			table.insert(g.limits, limit)
+			g.worst = math.max(g.worst, limit.used or -1)
+		end
+	end
+	for _, g in groups do
+		table.sort(g.limits, function(a: Limit, b: Limit): boolean
+			return (a.used or -1) > (b.used or -1)
+		end)
+	end
+	table.sort(groups, function(a: LimitGroup, b: LimitGroup): boolean
+		if a.worst ~= b.worst then return a.worst > b.worst end
+		return a.provider < b.provider
+	end)
+	return groups
 end
 
 return common

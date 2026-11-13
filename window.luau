@@ -21,6 +21,7 @@
 local common = require("./common")
 local sessions = require("./sessions")
 local usage = require("./usage")
+local boards = require("./boards")
 
 type Row = common.Row
 type Agent = common.Agent
@@ -1109,8 +1110,102 @@ local function resume(cx: WindowCx, target: string?, restore: boolean)
 	refresh_catalog(5000)
 end
 
+-- Agent discovery shares the snapshot cache; it never performs another slow list read.
+local function board_agents(): { [string]: boolean }
+	local found: { [string]: boolean } = {}
+	for id in agents_kept do found[id] = true end
+	return found
+end
+
+local function refresh_boards(cx: WindowCx)
+	boards.refresh(cx, board_agents(), send_all)
+end
+
+-- Resolve again after prompting: a board may have changed while the prompt was open.
+local function board_action(cx: WindowCx, verb: string, target: string?, room: number)
+	if target == nil then return end
+	local decoded, text = pcall(tern.base64.decode, target)
+	if not decoded then return end
+	local parsed, request = pcall(tern.json.decode, text)
+	if not parsed or type(request) ~= "table" or type(request.path) ~= "string" or request.room ~= room then return end
+	if (verb == "board_check" or verb == "board_move" or verb == "board_edit") and type(request.card) ~= "string" then return end
+	if verb == "board_check" and type(request.done) ~= "boolean" then return end
+	if (verb == "board_move" or verb == "board_add") and type(request.lane) ~= "string" then return end
+	local function resolve(on: WindowCx, edited: string?)
+		boards.collect(on, board_agents(), function(report, later)
+			if later == nil then return end
+			local selected: boards.Board? = nil
+			for _, b in report.boards do
+				if b.path == request.path then selected = b; break end
+			end
+			if selected == nil then
+				later:toast("error", "Board is no longer available", report.error)
+				refresh_boards(later)
+				return
+			end
+			if verb == "board_open" or verb == "board_pin" then
+				local opened, pane = pcall(function() return later.board:open(selected.path) end)
+				if not opened then later:toast("error", "Could not open board", tostring(pane))
+				elseif verb == "board_pin" then pin(later, pane :: number, room) end
+				refresh_boards(later)
+				return
+			end
+			local card: boards.Card? = nil
+			local lane_found = false
+			for _, lane in selected.lanes do
+				if lane.id == request.lane then lane_found = true end
+				for _, item in lane.cards do if item.id == request.card then card = item end end
+			end
+			if selected.error or (verb ~= "board_add" and card == nil) or ((verb == "board_move" or verb == "board_add") and not lane_found) then
+				later:toast("error", "Board changed; refresh and try again", selected.error)
+				refresh_boards(later)
+				return
+			end
+			if (verb == "board_add" or verb == "board_edit") and edited == nil then
+				later:prompt({ value = if card then card.text else "", placeholder = if card then "Edit card" else "New card", action = if card then "save" else "add" })
+					:next(function(value: string?, _err: string?, nextcx: WindowCx?)
+						local trimmed = if value then string.match(value, "^%s*(.-)%s*$") else nil
+						if nextcx and trimmed and trimmed ~= "" then resolve(nextcx, trimmed) end
+					end)
+				return
+			end
+			local function finished(success: boolean, err: string?, nextcx: WindowCx?)
+				if nextcx then
+					if not success then nextcx:toast("error", "Could not update board", err) end
+					refresh_boards(nextcx)
+				end
+			end
+			local started, why = pcall(function()
+				if verb == "board_add" then
+					later.board:add(selected.path, { lane = request.lane, text = edited :: string }):next(function(id, err, nextcx)
+						finished(id ~= nil, err, nextcx)
+					end)
+				else
+					local pending: Awaitable<boolean>
+					if verb == "board_check" then pending = later.board:check(request.card, request.done)
+					elseif verb == "board_move" then pending = later.board:move(request.card, request.lane)
+				else
+					local current = card :: boards.Card
+					pending = later.board:edit(request.card, { text = edited, tags = current.tags, due = current.due })
+				end
+					pending:next(function(result, err, nextcx) finished(result == true, err, nextcx) end)
+				end
+			end)
+			if not started then finished(false, tostring(why), later) end
+		end)
+	end
+	resolve(cx, nil)
+end
+
 --- Requests with a text target: a session id, an encoded query (`search`) or pane ids (bulk).
-local SESSION_ACTIONS: { [string]: (WindowCx, string?) -> () } = {
+local SESSION_ACTIONS: { [string]: (WindowCx, string?, number) -> () } = {
+	boards = function(cx: WindowCx, _target: string?) refresh_boards(cx) end,
+	board_open = function(cx: WindowCx, target: string?, room: number) board_action(cx, "board_open", target, room) end,
+	board_pin = function(cx: WindowCx, target: string?, room: number) board_action(cx, "board_pin", target, room) end,
+	board_check = function(cx: WindowCx, target: string?, room: number) board_action(cx, "board_check", target, room) end,
+	board_move = function(cx: WindowCx, target: string?, room: number) board_action(cx, "board_move", target, room) end,
+	board_add = function(cx: WindowCx, target: string?, room: number) board_action(cx, "board_add", target, room) end,
+	board_edit = function(cx: WindowCx, target: string?, room: number) board_action(cx, "board_edit", target, room) end,
 	usage = function(cx: WindowCx, _target: string?)
 		refresh_usage(cx, USAGE_MIN_S, true)
 	end,
@@ -1167,7 +1262,7 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 	if session_action then
 		tern.timer(0, function(later: WindowCx?)
 			if later and claim(nonce) then
-				session_action(later, target)
+				session_action(later, target, room)
 			end
 		end)
 		return { handled = true }

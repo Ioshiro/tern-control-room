@@ -1,0 +1,233 @@
+/* The aggregate reuses the native board block's markup, so Tern's board.css
+   draws lanes, cards, checks and chips. These rules only adapt it to a
+   scrolling page: no pane height to fill, plugin elements' inline-flex
+   default, inert controls, and the session headers between boards. */
+/* Plugin buttons carry Tern's chip look (`button:where(.sf-el)`, specificity
+   0-0-1); the native board's buttons start bare. This reset matches that
+   specificity and comes later, so it beats the chip look while every one-class
+   bd-* rule still wins over it. */
+:where([data-surface='plugin.control-room.room'] .cr-board) button:where(.sf-el),
+:where([data-surface='plugin.control-room.room'] .cr-board) button:where(.sf-el:hover) {
+  justify-content: flex-start;
+  height: auto;
+  padding: 0;
+  font: inherit;
+  letter-spacing: inherit;
+  background: none;
+  box-shadow: none;
+}
+:where([data-surface='plugin.control-room.room'] .cr-board) button:where(.sf-el:active) {
+  transform: none;
+}
+[data-surface='plugin.control-room.room'] {
+  .cr-board .bd-hb,
+  .cr-board .bd-lb {
+    justify-content: center;
+  }
+  .cr-board {
+    flex: none;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    border-radius: var(--r-card);
+    background: var(--tv-bg);
+    box-shadow: 0 0 0 1px var(--l1);
+    overflow: hidden;
+    cursor: default;
+  }
+  .cr-board .bd-bar {
+    display: flex;
+    cursor: default;
+  }
+  .cr-board .bd-main {
+    display: flex;
+  }
+  /* A page scrolls as a whole: lanes grow with their cards and scroll sideways. */
+  .cr-board .bd-lanes {
+    display: flex;
+    overflow-y: visible;
+    scrollbar-width: thin;
+  }
+  .cr-board .bd-lane {
+    display: flex;
+    max-height: none;
+    cursor: default;
+  }
+  .cr-board .bd-lh,
+  .cr-board .bd-cm,
+  .cr-board .bd-cmeta,
+  .cr-board .bd-loc {
+    cursor: inherit;
+  }
+  .cr-board .bd-lh,
+  .cr-board .bd-loc {
+    display: flex;
+  }
+  .cr-board .bd-cards {
+    display: flex;
+    overflow: visible;
+  }
+  .cr-board .bd-card {
+    display: flex;
+    cursor: pointer;
+  }
+  .cr-board .bd-cm {
+    display: flex;
+  }
+  .cr-board .bd-ct {
+    display: block;
+  }
+  .cr-board .bd-lt,
+  .cr-board .bd-ln,
+  .cr-board .bd-count,
+  .cr-board .bd-dir,
+  .cr-board .bd-name {
+    display: inline;
+  }
+  .cr-board .bd-card.has-meta .bd-cmeta {
+    display: flex;
+  }
+  .cr-board .bd-card:not(.has-meta) .bd-cmeta {
+    display: none;
+  }
+  .cr-board .bd-ldone {
+    display: none;
+  }
+  .cr-board .bd-lane.done-lane .bd-ldone {
+    display: inline-flex;
+  }
+  .cr-board .bd-hint.on {
+    display: inline-flex;
+  }
+  .cr-board .bd-hint {
+    gap: 4px;
+    cursor: pointer;
+    border: 0;
+    white-space: nowrap;
+    .sf-icon,
+    .sf-icon .ico {
+      width: 11px;
+      height: 11px;
+    }
+  }
+  .cr-board .bd-ck,
+  .cr-board .bd-hb,
+  .cr-board .bd-lb {
+    display: inline-grid;
+    place-items: center;
+    gap: 0;
+  }
+  .cr-board .bd-add {
+    display: flex;
+  }
+  .cr-board .bd-ck .sf-icon,
+  .cr-board .bd-lb .sf-icon,
+  .cr-board .bd-hb .sf-icon {
+    display: contents;
+  }
+  /* The selected card shows its menu button where the native board shows none. */
+  .cr-board .cr-more {
+    flex: none;
+    align-self: flex-start;
+    width: 20px;
+    height: 20px;
+    margin: -2px -4px 0 0;
+    opacity: 1;
+  }
+  .cr-board .cr-off {
+    opacity: 0.4;
+    pointer-events: none;
+  }
+  .cr-board .bd-lb.cr-off {
+    opacity: 0;
+  }
+  .cr-board .cr-lmore {
+    margin: 2px 0 0;
+    color: var(--t3);
+  }
+  .cr-board .cr-bmore {
+    margin: 0 12px 10px;
+  }
+  .cr-board .cr-state {
+    flex: 1;
+    display: flex;
+    padding: 16px 12px;
+  }
+  /* List mode keeps the native list's rows; the bar stays. */
+  .cr-board.list .bd-lanes {
+    display: block;
+    padding: 6px 0 10px;
+  }
+  .cr-board.list .bd-cards {
+    display: block;
+  }
+  .cr-board.list .bd-cm {
+    flex-direction: row;
+  }
+
+  /* Session headers fold the boards of one Tern session. */
+  .cr-sess {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    margin-left: -4px;
+    padding: 0 8px 0 4px;
+    border: 0;
+    border-radius: 7px;
+    background: none;
+    box-shadow: none;
+    font: 550 12.5px/1 var(--sans);
+    color: var(--t1);
+    cursor: pointer;
+    .sf-icon {
+      width: 14px;
+      height: 14px;
+      color: var(--t3);
+      transition: transform 0.2s var(--out);
+    }
+    .sf-icon .ico {
+      width: 11px;
+      height: 11px;
+    }
+    &:hover {
+      background: var(--l1);
+    }
+    &.folded .sf-icon {
+      transform: rotate(-90deg);
+    }
+  }
+  .cr-sess-n {
+    font: 11px var(--mono);
+    color: var(--t3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* The native skeleton and empty state, laid out in flow instead of over a pane. */
+  .cr-skel {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 4px 0;
+  }
+  .cr-skel .bd-skel-lane {
+    display: flex;
+  }
+  .cr-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 48px 24px;
+    text-align: center;
+  }
+  .cr-empty .bd-ring {
+    display: grid;
+  }
+}
+[data-role='control-room.board-backdrop'] {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+}

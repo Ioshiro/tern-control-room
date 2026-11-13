@@ -1,11 +1,12 @@
 schema = 1
 id = "control-room"
 name = "Control Room"
-version = "0.5.0"
+version = "0.6.0"
 description = "One persistent block to re-enter parallel work: sessions, tabs and agents, attention first; closed omp sessions in a searchable Archive."
 icon = "gauge"
 host = "host.luau"
 window = "window.luau"
+styles = ["boards.css", "tables.css"]
 
 [[blocks]]
 id = "room"

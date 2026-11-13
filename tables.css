@@ -1,0 +1,24 @@
+/* Panes, Agents and Limits show one table per group. Tern sizes each table's
+   columns from its own content and hides low-priority columns per table, so
+   groups drew their columns at different places. Every table of a kind gets
+   the same template instead, and every column stays: text ellipsizes. */
+[data-role='control-room.panes'] .sf-tbl {
+  /* Pane · Status (icon + word) · Last · Age */
+  grid-template-columns: minmax(24ch, 1.4fr) 13ch minmax(0, 2fr) 4.5em !important;
+}
+[data-role='control-room.panes'] :is(.sf-tbl-h, .sf-tbl-c).off {
+  display: block;
+}
+[data-role='control-room.panes'] .sf-tbl-c.c-text.off {
+  display: flex;
+}
+[data-role='control-room.limits'] .sf-tbl {
+  /* Window · Used · % · Resets */
+  grid-template-columns: minmax(18ch, 24ch) minmax(0, 1fr) 7.5ch 14ch !important;
+}
+[data-role='control-room.limits'] :is(.sf-tbl-h, .sf-tbl-c).off {
+  display: block;
+}
+[data-role='control-room.limits'] .sf-tbl-c.meter.off {
+  display: flex;
+}

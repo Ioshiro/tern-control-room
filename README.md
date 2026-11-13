@@ -8,20 +8,20 @@ aggiornamento a un agente, parcheggi o ripristini un pane. L'**Archivio**
 elenca le sessioni omp chiuse, con ricerca in tutti i prompt che hai scritto,
 e le riapre: puoi chiudere gli agenti che non usi senza perdere il filo.
 
-Non è un gestore di TODO: non salva elenchi o riepiloghi propri. Ogni riga è
-letta da Tern (o dai registri di omp, per l'Archivio) a ogni aggiornamento; i
-messaggi degli agenti sono il loro ultimo messaggio reale, non riassunti.
-L'unica cosa che scrive è la nota di passaggio che un agente lascia quando lo
-archivi.
+Non salva una seconda copia dei task: la vista **Boards** legge e modifica i
+`TODO.md` originali tramite il motore Kanban di Tern. Gli altri dati arrivano
+da Tern o dai registri di omp; i messaggi degli agenti sono i loro ultimi
+messaggi reali, non riassunti. L'Archivio conserva la nota di passaggio che
+un agente lascia prima di chiudersi.
 
 ## La pagina
 
 ```
 Control Room  18 panes · 7 sessions · updated 3s ago           [Live] [Refresh r]
 Attention 0 │ Running 1 │ Waiting 10 │ Idle 7 │ Limits 62%
-Panes 18   Agents 11   Failures 1   Limits 12   Archive 570
+Panes 18   Agents 11   Boards 2   Failures 1   Limits 2   Archive 570
 [⌕ filter /]                  [All | Attention | Active] [Flat | Session | Project]
-Pane · Where · Status · Last · Age              ┌ pane selezionato        [Go ⏎] ┐
+Pane · Status · Last · Age                      ┌ pane selezionato        [Go ⏎] ┐
 …righe…                                         │ fatti · azioni · peek · messaggi │
 ```
 
@@ -31,17 +31,23 @@ Pane · Where · Status · Last · Age              ┌ pane selezionato        
   sospende e lo riprende da solo, da 5 s a 5 min) o `No window report` (nessuna
   finestra ha ancora riferito: si vede solo ciò che sa il daemon).
 - **Strip di numeri**: quanti pane richiedono attenzione (e perché: agenti in
-  attesa di input, falliti), quanti lavorano (agenti, comandi), quanti aspettano
-  un prompt, quanti sono inattivi, e i **limiti** dei provider (vedi sotto).
+  attesa di input, falliti, finiti e non ancora visti), quanti lavorano (agenti,
+  comandi), quanti aspettano un prompt, quanti sono inattivi, e i **limiti** dei
+  provider (vedi sotto).
 - **Viste**: *Panes* (tutti), *Agents* (solo i pane con un agente), *Failures*
   (i comandi falliti visti da questa finestra, vedi sotto), *Limits* (limiti dei
   provider e credenziali non in uso, vedi sotto), *Archive* (le sessioni omp
-  chiuse, vedi sotto).
-- **Tabella**: un punto colorato per stato, titolo, sessione › tab (o *parked*),
-  stato, ultimo risultato (ultimo comando con esito e durata, oppure l'ultimo
-  messaggio dell'agente) e da quanto è cambiata. Le colonne meno importanti si
-  nascondono quando il blocco è stretto. Il tasto destro su una riga offre le
-  stesse azioni della scheda.
+  chiuse, vedi sotto), *Boards* (Kanban dei progetti nelle sessioni aperte).
+  Un numero accanto al nome compare solo quando il dato è stato letto; *Limits*
+  conta le credenziali disattivate, *Failures* solo se ce ne sono.
+- **Tabella**: titolo; stato come icona e parola breve (*asks you*, *working*,
+  *ready*, *done*, *failed*…; la frase intera è nel tooltip e nella scheda);
+  dove sta il pane lo dicono il raggruppamento per sessione o progetto e
+  l'intestazione della scheda (sessione › tab o *parked*), e il filtro lo cerca; ultimo
+  risultato (ultimo comando con esito e durata, oppure l'ultimo messaggio
+  dell'agente) e da quanto è cambiata. Tutti i gruppi usano la stessa griglia
+  di colonne (`tables.css`), quindi restano allineati. Il tasto destro su una
+  riga offre le stesse azioni della scheda.
 - **Scheda del pane selezionato**: accanto alla tabella quando ci sta, sotto
   altrimenti. La pagina sta nell'altezza del pane: scorrono solo la tabella e
   il corpo della scheda, non il blocco intero. Mostra cartella, programma, comando in
@@ -85,10 +91,11 @@ urgente va in alto).
 | `⇧A` | archivia gli inattivi: ogni agente omp in elenco fermo da più di un'ora (con conferma) |
 | `x` | archivia il problema della riga (vedi sotto) |
 | `/` | filtra: digita, `Enter` conferma, `Esc` cancella; frecce, `Home`/`End` e `Canc` spostano il cursore, il mouse seleziona |
-| `Tab`/`⇧Tab` (`]`/`[`) | vista: Panes → Agents → Failures → Limits → Archive |
+| `Tab`/`⇧Tab` (`]`/`[`) | vista: Panes → Agents → Boards → Failures → Limits → Archive |
 | `v` | ambito: tutto → richiede attenzione → non inattivo |
 | `g` | raggruppa: nessuno → per sessione → per progetto |
 | `r` | aggiorna ora (in Limits: rilegge i limiti; nell'Archivio: rilegge le sessioni) |
+| `?` | la barra in basso mostra tutti i tasti della vista, non solo i principali (si ricorda) |
 
 Nell'Archivio `Enter` (o doppio clic) riprende la sessione, `⇧R` la riprende
 e fa proseguire il turno interrotto, `.` ne mostra gli ultimi prompt e recap,
@@ -156,16 +163,63 @@ nella cartella del pane selezionato (`cx.agents:start`).
 **Failures** elenca gli ultimi 20 comandi con exit ≠ 0 arrivati come evento
 `command_finished` a una finestra con il plugin caricato, solo per i pane
 ancora aperti. Stanno nel `kv.json` (chiave `failures`), quindi sopravvivono
-al reload. Il tasto destro su una riga porta al pane o ne fa il peek.
+al reload. Il tasto destro su una riga porta al pane o ne fa il peek. Un comando
+breve fallito subito (exit 1 o 127 in meno di mezzo secondo, come `cd ..ù`) è
+probabilmente un refuso: resta in elenco, ma in grigio.
+
+## Boards: i TODO dei progetti aperti
+
+La vista **Boards** raccoglie i `TODO.md` esistenti nelle cartelle dei pane
+locali e nelle radici dei loro checkout Git. Ogni sessione è una sezione
+richiudibile; ogni progetto mantiene le colonne e l'ordine del proprio file.
+Più agenti nella stessa cartella condividono una board. Una board presente
+in più sessioni compare in ciascuna, ma il conteggio del tab la conta una volta.
+Per gli agenti pinnati si usa la sessione d'origine salvata da Control Room.
+
+Ogni board usa lo stesso markup del Kanban nativo (`tn-board`, `bd-*`), quindi
+la disegna il `board.css` di Tern: colonne, schede, checkbox rotonde, chip dei
+tag con lo stesso colore, scadenze, vista lista. `boards.css` adatta soltanto
+il layout a una pagina che scorre.
+
+- Il **cerchio** completa o riapre la scheda nel file originale. Clic su una
+  scheda la seleziona; il suo **⋯** apre **Move to…** (le altre colonne),
+  **Edit** e **Open board**, sopra la vista e fuori dall'area scorrevole.
+- **+** nell'intestazione della colonna e **Add card** in fondo creano un task
+  tramite un prompt nativo; **Edit** modifica il titolo preservando note, tag,
+  scadenza e sottotask.
+- Nella barra della board, **↗** apre il Kanban nativo e **📌** lo mette sopra
+  Control Room (premuto di nuovo lo rimette a posto). Dettagli completi,
+  drag-and-drop e undo restano nella board nativa. Le pillole degli agenti
+  associati ne alternano il pin.
+- Il filtro cerca nelle schede e nei progetti. **Board / List** cambia la
+  presentazione; l'occhio mostra o nasconde le schede completate.
+  Preferenze e sezioni richiuse si salvano, non i task.
+- Tasti, come nella board nativa: `↑`/`↓` seleziona, `←`/`→` sposta la scheda
+  nella colonna accanto, `Spazio` la completa, `e` la modifica, `Enter` apre la
+  board, `m` apre il menu (`↑`/`↓` e `Enter` scelgono la colonna, `Esc` o un
+  clic fuori lo chiudono). `/` attiva il filtro, `v` cambia Board/List, `d`
+  mostra i completati.
+- `r` rilegge le board. La vista richiede un aggiornamento ogni 15 secondi
+  mentre viene renderizzata; non aggiunge letture allo snapshot ordinario dei
+  pane. Un rapporto vecchio è segnalato come *Stale* e le azioni restano
+  sospese finché non arriva una lettura nuova.
+
+Nessun file viene creato automaticamente. Il motore nativo legge fino a 500
+righe e 64.000 caratteri per board: eventuali contenuti omessi sono segnalati
+con il rimando alla board completa. Gli ID delle schede cambiano dopo modifiche
+esterne: un'azione su un ID scaduto viene rifiutata e la vista aggiornata,
+senza cercare una scheda omonima. Le API board richiedono Tern desktop e file
+locali; le cartelle dei pane remoti non vengono scansionate.
 
 ## Limiti dei provider
 
 La vista **Limits** e l'ultima tessera della strip mostrano quello che `omp usage
---json` riporta: per ogni account di ogni provider le finestre di limite
-(percentuale usata, quando si azzerano) e le **credenziali che omp ha disattivato**
-con la causa (token revocato, refresh fallito). La tessera dice la percentuale
-più alta, o `2 credentials off` se ci sono credenziali disattivate, e diventa
-rossa se un limite è esaurito. `omp usage` impiega alcuni secondi: gira fuori dal
+--json` riporta: una sezione per account di ogni provider con le sue finestre di
+limite (percentuale usata, quando si azzerano; finestre identiche una volta sola)
+e le **credenziali che omp ha disattivato** con la causa in breve (il testo
+completo è nel tooltip). La tessera dice la percentuale più alta e diventa ambra
+dall'80%, rossa a limite esaurito; le credenziali disattivate sono nel sottotitolo,
+in ambra, senza colorare il numero. `omp usage` impiega alcuni secondi: gira fuori dal
 thread della UI, al caricamento, ogni 10 minuti, a un fine turno fallito (un limite
 esaurito o una credenziale disattivata sono cause comuni) e con `r` nella vista.
 L'ultimo rapporto sta nel `kv.json` (chiave `usage`): il blocco lo mostra subito
@@ -270,7 +324,7 @@ tern plugin link ./tern-control-room
 ```
 
 Verifica con `tern plugin list`, che deve mostrare
-`control-room 0.5.0 Control Room — 1 blocks, 0 lenses, window  ready`.
+`control-room 0.6.0 Control Room — 1 blocks, 0 lenses, window  ready`.
 Per rimuoverlo: `tern plugin remove control-room` (o `tern plugin unlink control-room`
 se era collegato).
 
@@ -358,6 +412,10 @@ daemon.
 - `host.luau`: il blocco (pagina, viste, tasti, filtri, ordinamento).
 - `archive.luau`: indice e ranking dell'Archivio (lato blocco).
 - `window.luau`: snapshot, peek, azioni, comando di palette e tasto.
+- `boards.luau`: scoperta e lettura delle board native, validazione del rapporto.
+- `boards_view.luau`: Kanban aggregati per sessione sul markup della board nativa, e i loro controlli.
+- `boards.css`: adatta il markup `bd-*` della board nativa a una pagina che scorre.
+- `tables.css`: una griglia di colonne comune a tutte le tabelle Panes/Agents, così i gruppi restano allineati.
 - `sessions.luau`: elenco, lease, ricerca, peek e ripresa delle sessioni
   chiuse; note di passaggio (lato finestra).
 - `common.luau`: tipi dello snapshot, del peek e dell'Archivio,
@@ -367,7 +425,7 @@ Controllo dei tipi con [luau-lsp](https://github.com/JohnnyMorganz/luau-lsp):
 
 ```sh
 tern plugin types .
-luau-lsp analyze --platform=standard --definitions=@tern=tern.d.luau host.luau window.luau common.luau sessions.luau archive.luau
+luau-lsp analyze --platform=standard --definitions=@tern=tern.d.luau host.luau window.luau common.luau sessions.luau archive.luau boards.luau boards_view.luau
 ```
 
 `dev/` contiene due aiuti per provarlo senza agenti o shell reali:
